@@ -1,0 +1,13 @@
+.next/
+node_modules/
+.venv/
+.vendor/
+__pycache__/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+*.pyc
+.env
+.env.local
+tsconfig.tsbuildinfo

@@ -71,3 +71,19 @@ export interface AppSnapshot {
   last_hypothesis: string | null;
   last_updated: string;
 }
+
+export interface HealthReport {
+  status: "ok";
+  service: string;
+  version: string;
+  time: string;
+  host: string;
+  project_root: string;
+  config_loaded: boolean;
+  watcher_active: boolean;
+  watched_root: string | null;
+  websocket_clients: number;
+  process_status: ProcessStatus;
+  git_required_for_start: boolean;
+  endpoints: Record<string, string>;
+}

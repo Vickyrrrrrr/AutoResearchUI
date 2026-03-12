@@ -1,0 +1,17 @@
+
+> autoresearchui@0.1.0 dev
+> next dev --hostname 127.0.0.1 --port 3010
+
+  ▲ Next.js 14.2.35
+  - Local:        http://127.0.0.1:3010
+  - Network:      http://127.0.0.1:3010
+
+ ✓ Starting...
+ ✓ Ready in 1396ms
+ ○ Compiling / ...
+ ✓ Compiled / in 4.8s (1630 modules)
+ GET / 200 in 43ms
+ GET / 200 in 46ms
+ ✓ Compiled in 859ms (1630 modules)
+ GET / 200 in 217ms
+[?25h

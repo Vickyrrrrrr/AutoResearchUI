@@ -1,0 +1,213 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  scroll-behavior: smooth;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: #f4efe6;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  color: #16120d;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background:
+    radial-gradient(circle at top left, rgba(159, 122, 66, 0.10), transparent 22%),
+    radial-gradient(circle at bottom right, rgba(45, 138, 93, 0.08), transparent 24%),
+    #f4efe6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+::selection {
+  background: rgba(159, 122, 66, 0.18);
+  color: #16120d;
+}
+
+@keyframes premiumFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes premiumPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(159, 122, 66, 0.08);
+  }
+  50% {
+    box-shadow: 0 0 0 14px rgba(159, 122, 66, 0);
+  }
+}
+
+@keyframes premiumMarquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes premiumGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(159, 122, 66, 0.10);
+    opacity: 0.92;
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(159, 122, 66, 0);
+    opacity: 1;
+  }
+}
+
+@keyframes premiumSheen {
+  0% {
+    transform: translateX(-130%);
+  }
+  100% {
+    transform: translateX(160%);
+  }
+}
+
+.premium-fade-up {
+  animation: premiumFadeUp 480ms ease-out;
+}
+
+.premium-ring {
+  animation: premiumPulse 2.6s ease-in-out infinite;
+}
+
+.premium-marquee {
+  width: max-content;
+  min-width: 100%;
+  animation: premiumMarquee 34s linear infinite;
+}
+
+.premium-marquee:hover {
+  animation-play-state: paused;
+}
+
+.premium-live-dot,
+.premium-stage-dot {
+  animation: premiumGlow 2.8s ease-in-out infinite;
+}
+
+.premium-panel {
+  position: relative;
+  transition:
+    transform 360ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 360ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 240ms ease-out,
+    background-color 240ms ease-out;
+  will-change: transform;
+}
+
+.premium-panel:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 28px 70px rgba(44, 33, 20, 0.10);
+}
+
+.premium-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 -20%;
+  width: 22%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.30), transparent);
+  opacity: 0.9;
+  pointer-events: none;
+  transform: translateX(-130%);
+  animation: premiumSheen 7.2s ease-in-out infinite;
+}
+
+.premium-button,
+.premium-subtle-button {
+  transition:
+    transform 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 240ms ease-out,
+    border-color 200ms ease-out,
+    background-color 200ms ease-out,
+    filter 200ms ease-out;
+}
+
+.premium-button:hover,
+.premium-subtle-button:hover {
+  transform: translateY(-1px);
+}
+
+.premium-button:hover {
+  filter: brightness(1.04);
+  box-shadow: 0 16px 32px rgba(159, 122, 66, 0.18);
+}
+
+.premium-subtle-button:hover {
+  border-color: rgba(22, 18, 13, 0.14);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 12px 24px rgba(44, 33, 20, 0.06);
+}
+
+.premium-button:disabled,
+.premium-subtle-button:disabled {
+  transform: none;
+  box-shadow: none;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(22, 18, 13, 0.18) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+  background-color: rgba(22, 18, 13, 0.16);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .premium-fade-up,
+  .premium-ring,
+  .premium-marquee,
+  .premium-live-dot,
+  .premium-stage-dot,
+  .premium-panel,
+  .premium-button,
+  .premium-subtle-button {
+    animation: none;
+    transition: none;
+    transform: none;
+  }
+
+  .premium-sheen::after {
+    animation: none;
+  }
+}

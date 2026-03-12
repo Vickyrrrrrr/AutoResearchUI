@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import io
 import json
 import os
+import socket
 import shlex
 import subprocess
+import sys
 import threading
 from collections import deque
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,7 @@ ROOT_DIR = Path.cwd()
 MAX_POINTS = 1_000
 MAX_EXPERIMENTS = 250
 MAX_STDOUT_LINES = 300
+DEFAULT_ALLOWED_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
 
 OptimizationGoal = Literal["minimize", "maximize"]
 ExperimentStatus = Literal["KEPT", "DISCARDED", "INFO"]
@@ -67,6 +69,47 @@ def iso_from_value(value: Any) -> str:
             return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).isoformat()
         return text
     return utc_now()
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_allowed_origins() -> list[str]:
+    raw = os.getenv("AUTORESEARCH_ALLOWED_ORIGINS")
+    if not raw:
+        return list(DEFAULT_ALLOWED_ORIGINS)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def is_subpath(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def safe_mtime(path: Path) -> float:
+    with suppress(OSError):
+        return path.stat().st_mtime
+    return 0.0
+
+
+def split_command(command: str) -> list[str]:
+    normalized = command.strip()
+    if not normalized:
+        return []
+
+    # Use POSIX-style splitting on every platform so quoted Windows paths like
+    # "C:\\Program Files\\Python\\python.exe" are unwrapped before Popen.
+    try:
+        return shlex.split(normalized, posix=True)
+    except ValueError:
+        return shlex.split(normalized, posix=os.name != "nt")
 
 
 class GitCommit(BaseModel):
@@ -139,9 +182,38 @@ class AppSnapshot(BaseModel):
     last_updated: str = Field(default_factory=utc_now)
 
 
+class HealthReport(BaseModel):
+    status: Literal["ok"] = "ok"
+    service: str = "autoresearch-sidecar"
+    version: str = "0.1.0"
+    time: str = Field(default_factory=utc_now)
+    host: str = Field(default_factory=socket.gethostname)
+    project_root: str = str(ROOT_DIR)
+    config_loaded: bool = False
+    watcher_active: bool = False
+    watched_root: str | None = None
+    websocket_clients: int = 0
+    process_status: Literal["idle", "running", "stopping", "errored"] = "idle"
+    git_required_for_start: bool = True
+    endpoints: dict[str, str] = Field(
+        default_factory=lambda: {
+            "health": "/api/health",
+            "discovery": "/api/discovery",
+            "state": "/api/state",
+            "config": "/api/config",
+            "start": "/api/process/start",
+            "stop": "/api/process/stop",
+            "restart": "/api/process/restart",
+            "websocket": "/ws",
+        }
+    )
+
+
 class ProjectScanner:
     LOG_SUFFIXES = {".csv", ".tsv", ".json"}
     SCRIPT_SUFFIXES = {".py", ".v"}
+    SKIP_DIRS = {".git", ".next", "node_modules", "dist", "build", "__pycache__", ".venv", "venv", ".vendor", ".mypy_cache"}
+    IGNORE_LOG_NAMES = {"package.json", "package-lock.json", "tsconfig.json", "tsconfig.tsbuildinfo"}
 
     @classmethod
     def discover(cls, root: Path) -> DiscoveryResult:
@@ -151,19 +223,21 @@ class ProjectScanner:
         logs: list[Path] = []
         scripts: list[Path] = []
         headers_by_file: dict[str, list[str]] = {}
-        for candidate in root.rglob("*"):
-            if not candidate.is_file():
-                continue
-            if ".git" in candidate.parts:
-                continue
-            suffix = candidate.suffix.lower()
-            if suffix in cls.LOG_SUFFIXES:
-                logs.append(candidate)
-            if suffix in cls.SCRIPT_SUFFIXES:
-                scripts.append(candidate)
+        for current_root, dir_names, file_names in os.walk(root):
+            dir_names[:] = [name for name in dir_names if name not in cls.SKIP_DIRS]
+            base = Path(current_root)
+            for file_name in file_names:
+                candidate = base / file_name
+                suffix = candidate.suffix.lower()
+                if suffix in cls.LOG_SUFFIXES:
+                    if candidate.name in cls.IGNORE_LOG_NAMES:
+                        continue
+                    logs.append(candidate)
+                if suffix in cls.SCRIPT_SUFFIXES:
+                    scripts.append(candidate)
 
-        logs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-        scripts.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        logs.sort(key=safe_mtime, reverse=True)
+        scripts.sort(key=safe_mtime, reverse=True)
 
         for item in logs[:20]:
             headers_by_file[str(item)] = cls.infer_headers(item)
@@ -185,7 +259,7 @@ class ProjectScanner:
         if suffix in {".csv", ".tsv"}:
             delimiter = "\t" if suffix == ".tsv" else ","
             try:
-                with path.open("r", encoding="utf-8", newline="") as handle:
+                with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
                     for line in handle:
                         if line.strip():
                             return next(csv.reader([line], delimiter=delimiter))
@@ -197,7 +271,7 @@ class ProjectScanner:
 
         if suffix == ".json":
             try:
-                with path.open("r", encoding="utf-8") as handle:
+                with path.open("r", encoding="utf-8", errors="ignore") as handle:
                     sample = handle.read(131072).strip()
             except OSError:
                 return []
@@ -239,6 +313,99 @@ class ProjectScanner:
         return Path(repo.working_tree_dir).resolve(), commits
 
 
+class AutoMapper:
+    MAXIMIZE_HINTS = ("accuracy", "acc", "score", "reward", "f1", "precision", "recall", "slack", "throughput")
+    MINIMIZE_HINTS = ("loss", "error", "wer", "cer", "bpb", "area", "power", "latency", "runtime", "cost")
+    METRIC_PRIORITY = (
+        "accuracy",
+        "acc",
+        "score",
+        "reward",
+        "f1",
+        "timing_slack",
+        "slack",
+        "loss",
+        "bpb",
+        "area",
+        "power",
+    )
+    NON_METRIC_KEYS = {
+        "iteration",
+        "iter",
+        "step",
+        "trial",
+        "experiment",
+        "timestamp",
+        "time",
+        "datetime",
+        "created_at",
+        "status",
+        "result",
+        "decision",
+        "hypothesis",
+        "reasoning",
+        "agent_reasoning",
+        "message",
+        "summary",
+        "notes",
+    }
+
+    @classmethod
+    def build_config(cls, discovery: DiscoveryResult) -> MappingConfig | None:
+        if not discovery.script_candidates or not discovery.log_candidates:
+            return None
+
+        script = discovery.script_candidates[0]
+        log_file = discovery.log_candidates[0]
+        headers = discovery.headers_by_file.get(log_file, [])
+        metric = cls.pick_metric(headers)
+        if not metric:
+            return None
+
+        goal: OptimizationGoal = cls.infer_goal(metric)
+        return MappingConfig(
+            project_root=discovery.project_root,
+            script_to_watch=script,
+            log_file=log_file,
+            y_axis_metric=metric,
+            optimization_goal=goal,
+            research_command=cls.default_command(Path(script)),
+        )
+
+    @classmethod
+    def pick_metric(cls, headers: list[str]) -> str | None:
+        if not headers:
+            return None
+
+        lowered = {header.lower(): header for header in headers}
+        for name in cls.METRIC_PRIORITY:
+            if name in lowered:
+                return lowered[name]
+
+        for header in headers:
+            if header.lower() not in cls.NON_METRIC_KEYS:
+                return header
+        return headers[0]
+
+    @classmethod
+    def infer_goal(cls, metric_name: str) -> OptimizationGoal:
+        lowered = metric_name.lower()
+        if any(token in lowered for token in cls.MAXIMIZE_HINTS):
+            return "maximize"
+        if any(token in lowered for token in cls.MINIMIZE_HINTS):
+            return "minimize"
+        return "maximize" if "score" in lowered else "minimize"
+
+    @classmethod
+    def default_command(cls, script_path: Path) -> str:
+        suffix = script_path.suffix.lower()
+        if suffix == ".py":
+            return f'"{sys.executable}" "{script_path}"'
+        if suffix == ".v":
+            return f'echo "Set a real research command for {script_path.name}"'
+        return str(script_path)
+
+
 class IncrementalLogParser:
     def __init__(self, log_file: Path, metric_name: str, goal: OptimizationGoal) -> None:
         self.log_file = log_file
@@ -267,6 +434,7 @@ class IncrementalLogParser:
         if file_size < self.offset:
             self.reset()
 
+        start_offset = self.offset
         try:
             with self.log_file.open("r", encoding="utf-8", newline="") as handle:
                 handle.seek(self.offset)
@@ -280,7 +448,7 @@ class IncrementalLogParser:
 
         points: list[MetricPoint] = []
         experiments: list[ExperimentRecord] = []
-        for row in self._parse_chunk(chunk):
+        for row in self._parse_chunk(chunk, start_offset=start_offset):
             experiment = self._row_to_experiment(row)
             experiments.append(experiment)
             if experiment.metric_value is not None:
@@ -293,12 +461,12 @@ class IncrementalLogParser:
                 )
         return points, experiments
 
-    def _parse_chunk(self, chunk: str) -> list[dict[str, Any]]:
+    def _parse_chunk(self, chunk: str, start_offset: int) -> list[dict[str, Any]]:
         suffix = self.log_file.suffix.lower()
         if suffix in {".csv", ".tsv"}:
             return self._parse_delimited(chunk, delimiter="\t" if suffix == ".tsv" else ",")
         if suffix == ".json":
-            return self._parse_json(chunk)
+            return self._parse_json(chunk, start_offset=start_offset)
         return []
 
     def _parse_delimited(self, chunk: str, delimiter: str) -> list[dict[str, Any]]:
@@ -316,10 +484,10 @@ class IncrementalLogParser:
             rows.append(row)
         return rows
 
-    def _parse_json(self, chunk: str) -> list[dict[str, Any]]:
+    def _parse_json(self, chunk: str, start_offset: int) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         stripped = chunk.strip()
-        if self.offset == len(chunk) and stripped.startswith("["):
+        if start_offset == 0 and stripped.startswith("["):
             with suppress(json.JSONDecodeError):
                 payload = json.loads(stripped)
                 if isinstance(payload, list):
@@ -428,7 +596,7 @@ class FileWatcher:
 
 
 class ProcessOrchestrator:
-    def __init__(self, on_stdout: callable[[str], None], on_exit: callable[[int], None]) -> None:
+    def __init__(self, on_stdout: Callable[[str], None], on_exit: Callable[[int], None]) -> None:
         self.on_stdout = on_stdout
         self.on_exit = on_exit
         self.process: subprocess.Popen[str] | None = None
@@ -442,7 +610,7 @@ class ProcessOrchestrator:
             if self.process and self.process.poll() is None:
                 raise HTTPException(status_code=409, detail="Research process is already running.")
 
-            args = shlex.split(command, posix=os.name != "nt")
+            args = split_command(command)
             if not args:
                 raise HTTPException(status_code=400, detail="Empty research command.")
 
@@ -556,6 +724,19 @@ class ResearchCoordinator:
                 last_updated=utc_now(),
             )
 
+    def health_report(self) -> HealthReport:
+        with self.lock:
+            active_root = self.config.project_root if self.config else self.discovery.project_root if self.discovery else str(ROOT_DIR)
+            return HealthReport(
+                time=utc_now(),
+                project_root=active_root,
+                config_loaded=self.config is not None,
+                watcher_active=bool(self.watcher.observer and self.watcher.observer.is_alive()),
+                watched_root=str(self.watcher.root) if self.watcher.root else None,
+                websocket_clients=len(self.connections),
+                process_status=self.process.snapshot().status,
+            )
+
     def discover(self, root_path: str) -> DiscoveryResult:
         root = normalize_path(root_path)
         discovery = ProjectScanner.discover(root)
@@ -570,10 +751,23 @@ class ResearchCoordinator:
         log_file = normalize_path(config.log_file)
         if not root.exists():
             raise HTTPException(status_code=404, detail=f"Project root not found: {root}")
-        if not script.exists():
+        if not root.is_dir():
+            raise HTTPException(status_code=400, detail=f"Project root is not a directory: {root}")
+        if not is_subpath(script, root):
+            raise HTTPException(status_code=400, detail="Script to watch must be inside the selected project root.")
+        if not is_subpath(log_file, root):
+            raise HTTPException(status_code=400, detail="Log file must be inside the selected project root.")
+        if not script.exists() or not script.is_file():
             raise HTTPException(status_code=404, detail=f"Script to watch not found: {script}")
-        if not log_file.exists():
+        if not log_file.exists() or not log_file.is_file():
             raise HTTPException(status_code=404, detail=f"Log file not found: {log_file}")
+
+        available_headers = ProjectScanner.infer_headers(log_file)
+        if available_headers and config.y_axis_metric not in available_headers:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Metric '{config.y_axis_metric}' was not found in the selected log file headers.",
+            )
 
         resolved = MappingConfig(
             project_root=str(root),
@@ -598,6 +792,13 @@ class ResearchCoordinator:
         self.watcher.watch(root)
         self._schedule_broadcast()
         return self.snapshot()
+
+    def auto_configure(self, root_path: str) -> AppSnapshot | None:
+        discovery = self.discover(root_path)
+        mapping = AutoMapper.build_config(discovery)
+        if not mapping:
+            return None
+        return self.apply_config(mapping)
 
     def start_process(self) -> AppSnapshot:
         with self.lock:
@@ -671,7 +872,7 @@ class ResearchCoordinator:
             return
         script_path = normalize_path(self.config.script_to_watch)
         latest_commit = self.discovery.recent_commits[0] if self.discovery and self.discovery.recent_commits else None
-        current = script_path.read_text(encoding="utf-8") if script_path.exists() else ""
+        current = script_path.read_text(encoding="utf-8", errors="ignore") if script_path.exists() else ""
         previous = self.diff.after if self.diff.path == str(script_path) else current
         if not previous:
             previous = current
@@ -701,10 +902,15 @@ class ResearchCoordinator:
             return
         self.loop.call_soon_threadsafe(asyncio.create_task, self.broadcast())
 
-    async def register(self, websocket: WebSocket) -> None:
+    async def register(self, websocket: WebSocket) -> bool:
         await websocket.accept()
         self.connections.add(websocket)
-        await websocket.send_json(self.snapshot().model_dump(mode="json"))
+        try:
+            await websocket.send_json(self.snapshot().model_dump(mode="json"))
+        except Exception:
+            self.connections.discard(websocket)
+            return False
+        return True
 
     async def unregister(self, websocket: WebSocket) -> None:
         self.connections.discard(websocket)
@@ -724,6 +930,7 @@ class ResearchCoordinator:
 
 
 coordinator = ResearchCoordinator()
+ALLOWED_ORIGINS = parse_allowed_origins()
 
 
 app = FastAPI(
@@ -734,7 +941,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -744,6 +951,11 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup() -> None:
     coordinator.set_loop(asyncio.get_running_loop())
+    auto_root = os.getenv("AUTORESEARCH_AUTO_PROJECT_ROOT")
+    auto_config = parse_bool_env("AUTORESEARCH_AUTO_CONFIG", default=True)
+    if auto_root and auto_config:
+        with suppress(Exception):
+            coordinator.auto_configure(auto_root)
 
 
 @app.on_event("shutdown")
@@ -751,14 +963,18 @@ async def on_shutdown() -> None:
     coordinator.shutdown()
 
 
-@app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "time": utc_now()}
+@app.get("/api/health", response_model=HealthReport)
+async def health() -> HealthReport:
+    return coordinator.health_report()
 
 
 @app.get("/api/discovery", response_model=DiscoveryResult)
-async def discovery(root_path: str = Query(default=str(ROOT_DIR))) -> DiscoveryResult:
-    return coordinator.discover(root_path)
+async def discovery(root_path: str | None = Query(default=None)) -> DiscoveryResult:
+    if root_path:
+        return coordinator.discover(root_path)
+    if coordinator.discovery:
+        return coordinator.discovery
+    return coordinator.discover(str(ROOT_DIR))
 
 
 @app.post("/api/config", response_model=AppSnapshot)
@@ -788,9 +1004,16 @@ async def restart_process() -> AppSnapshot:
 
 @app.websocket("/ws")
 async def websocket_stream(websocket: WebSocket) -> None:
-    await coordinator.register(websocket)
+    origin = websocket.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        await websocket.close(code=1008, reason="Origin not allowed")
+        return
+    if not await coordinator.register(websocket):
+        return
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         await coordinator.unregister(websocket)

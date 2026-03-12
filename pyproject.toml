@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoresearchui"
+version = "0.1.0"
+description = "Open-source local dashboard and launcher for agentic research workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "AutoResearchUI contributors" }
+]
+keywords = ["research", "agents", "dashboard", "fastapi", "nextjs", "autoresearch"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Software Development :: Build Tools"
+]
+dependencies = [
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn[standard]>=0.30.0,<1.0.0",
+  "watchdog>=4.0.0,<5.0.0",
+  "GitPython>=3.1.43,<4.0.0",
+  "pydantic>=2.7.0,<3.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.0,<1.0.0"
+]
+
+[project.scripts]
+autoresearchui = "autoresearchui_cli:main"
+
+[tool.setuptools]
+py-modules = ["app_backend", "autoresearchui_cli"]
