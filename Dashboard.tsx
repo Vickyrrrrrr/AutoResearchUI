@@ -100,6 +100,8 @@ type CelebrationState = {
   delta: number;
 };
 
+type DashboardView = "overview" | "activity" | "diff";
+
 function buildWsUrl(base: string) {
   const url = new URL(base);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -198,11 +200,71 @@ function getStatusTone(status: ExperimentRecord["status"]) {
   return "border-black/6 bg-white/55 text-[var(--ink-soft)]";
 }
 
+function metricOptionsForLog(discovery: DiscoveryResult | null, logFile: string) {
+  if (!discovery) {
+    return [];
+  }
+  const fileSpecific = logFile ? discovery.headers_by_file?.[logFile] ?? [] : [];
+  const source = fileSpecific.length ? fileSpecific : discovery.suggested_metrics ?? [];
+  return Array.from(new Set(source));
+}
+
+function fileHintFor(discovery: DiscoveryResult | null, filePath: string, fallback: string) {
+  if (!discovery || !filePath) {
+    return fallback;
+  }
+  return discovery.file_hints?.[filePath] ?? fallback;
+}
+
+function defaultCommandForScript(discovery: DiscoveryResult | null, scriptPath: string) {
+  if (discovery?.suggested_command) {
+    const scriptName = scriptPath.split(/[\\/]/).pop()?.toLowerCase();
+    if (!scriptName || discovery.suggested_command.toLowerCase().includes(scriptName)) {
+      return discovery.suggested_command;
+    }
+  }
+  return scriptPath ? `python "${scriptPath}"` : "";
+}
+
+function isGenericScriptCommand(command: string | null | undefined, scriptPath: string) {
+  if (!command || !scriptPath) {
+    return false;
+  }
+  const normalizedCommand = command.trim().toLowerCase();
+  const normalizedScript = scriptPath.trim().toLowerCase();
+  return (
+    normalizedCommand === `python "${normalizedScript}"` ||
+    normalizedCommand === `python '${normalizedScript}'` ||
+    normalizedCommand === `python ${normalizedScript}` ||
+    normalizedCommand === `python.exe "${normalizedScript}"` ||
+    normalizedCommand === `python.exe '${normalizedScript}'` ||
+    normalizedCommand === `python.exe ${normalizedScript}`
+  );
+}
+
+function normalizeDiscovery(discovery: DiscoveryResult): DiscoveryResult {
+  return {
+    ...discovery,
+    log_candidates: discovery.log_candidates ?? [],
+    script_candidates: discovery.script_candidates ?? [],
+    headers_by_file: discovery.headers_by_file ?? {},
+    suggested_metrics: discovery.suggested_metrics ?? [],
+    suggested_command: discovery.suggested_command ?? null,
+    file_hints: discovery.file_hints ?? {},
+    recent_commits: discovery.recent_commits ?? [],
+  };
+}
+
 function deriveDefaults(discovery: DiscoveryResult, current: MappingConfig): MappingConfig {
   const logFile = current.log_file || discovery.log_candidates[0] || "";
-  const metricOptions = discovery.headers_by_file[logFile] ?? [];
+  const metricOptions = metricOptionsForLog(discovery, logFile);
   const script = current.script_to_watch || discovery.script_candidates[0] || "";
   const metric = metricOptions.includes(current.y_axis_metric) ? current.y_axis_metric : metricOptions[0] || "";
+  const suggestedCommand = defaultCommandForScript(discovery, script);
+  const researchCommand =
+    !current.research_command || isGenericScriptCommand(current.research_command, script)
+      ? suggestedCommand
+      : current.research_command;
 
   return {
     project_root: current.project_root || discovery.project_root,
@@ -210,7 +272,7 @@ function deriveDefaults(discovery: DiscoveryResult, current: MappingConfig): Map
     log_file: logFile,
     y_axis_metric: metric,
     optimization_goal: current.optimization_goal,
-    research_command: current.research_command || (script ? `python "${script}"` : ""),
+    research_command: researchCommand,
   };
 }
 
@@ -238,17 +300,39 @@ export default function Dashboard() {
   const [stateRouteState, setStateRouteState] = useState<ConnectionState>("checking");
   const [socketState, setSocketState] = useState<ConnectionState>("checking");
   const [celebration, setCelebration] = useState<CelebrationState | null>(null);
-  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [activeView, setActiveView] = useState<DashboardView>("overview");
   const [loopStageIndex, setLoopStageIndex] = useState(0);
+  const [hasMounted, setHasMounted] = useState(false);
   const bestMetricRef = useRef<number | null>(null);
   const chartRef = useRef<HTMLDivElement | null>(null);
 
   const deferredPoints = useDeferredValue(snapshot.metric_points);
   const deferredExperiments = useDeferredValue(snapshot.experiments);
-  const headers = useMemo(
-    () => (draft.log_file && discovery ? discovery.headers_by_file[draft.log_file] ?? [] : []),
-    [draft.log_file, discovery],
+  const headers = useMemo(() => metricOptionsForLog(discovery, draft.log_file), [draft.log_file, discovery]);
+  const scriptHint = useMemo(
+    () =>
+      fileHintFor(
+        discovery,
+        draft.script_to_watch,
+        "Choose the file the agent edits most often during the research loop. In many repos this is train.py or the main experiment entrypoint.",
+      ),
+    [discovery, draft.script_to_watch],
   );
+  const logHint = useMemo(
+    () =>
+      fileHintFor(
+        discovery,
+        draft.log_file,
+        "Choose the file where each experiment writes metrics. This is often results.tsv, metrics.csv, or a run.log file that prints loss or validation scores.",
+      ),
+    [discovery, draft.log_file],
+  );
+  const commandHint = useMemo(() => {
+    if (discovery?.suggested_command) {
+      return `Suggested from repo instructions: ${discovery.suggested_command}`;
+    }
+    return "Choose the command that actually runs one experiment loop. For autoresearch-style repos this is often `uv run train.py > run.log 2>&1`.";
+  }, [discovery]);
 
   async function runConnectionCheck() {
     setHttpState("checking");
@@ -281,10 +365,11 @@ export default function Dashboard() {
     async function bootstrap() {
       try {
         setLoading(true);
-        const [discovered] = await Promise.all([
+        const [rawDiscovery] = await Promise.all([
           requestJson<DiscoveryResult>("/api/discovery"),
           runConnectionCheck(),
         ]);
+        const discovered = normalizeDiscovery(rawDiscovery);
         if (ignore) {
           return;
         }
@@ -303,6 +388,7 @@ export default function Dashboard() {
     }
 
     bootstrap();
+    setHasMounted(true);
     return () => {
       ignore = true;
     };
@@ -332,8 +418,9 @@ export default function Dashboard() {
         startTransition(() => {
           setSnapshot(data);
           if (data.discovery) {
-            setDiscovery(data.discovery);
-            setDraft((current) => deriveDefaults(data.discovery!, { ...current, ...(data.config ?? {}) }));
+            const discovered = normalizeDiscovery(data.discovery);
+            setDiscovery(discovered);
+            setDraft((current) => deriveDefaults(discovered, { ...current, ...(data.config ?? {}) }));
           }
         });
       });
@@ -405,7 +492,7 @@ export default function Dashboard() {
       setBusy(true);
       setError(null);
       const query = projectRoot ? `?root_path=${encodeURIComponent(projectRoot)}` : "";
-      const discovered = await requestJson<DiscoveryResult>(`/api/discovery${query}`);
+      const discovered = normalizeDiscovery(await requestJson<DiscoveryResult>(`/api/discovery${query}`));
       setDiscovery(discovered);
       setDraft((current) => deriveDefaults(discovered, { ...current, project_root: discovered.project_root }));
     } catch (caught) {
@@ -584,6 +671,20 @@ export default function Dashboard() {
   }, [bestMetric, deferredPoints, draft.optimization_goal]);
 
   const healthCheckedAt = health ? formatDate(health.time) : "n/a";
+  const currentCommand = snapshot.process.command || draft.research_command || "n/a";
+  const lastResultLabel =
+    latestExperiment?.status === "KEPT"
+      ? "Improved and kept"
+      : latestExperiment?.status === "DISCARDED"
+        ? "No improvement"
+        : latestExperiment
+          ? "Logged"
+          : "Waiting";
+  const navItems: Array<{ id: DashboardView; label: string; detail: string }> = [
+    { id: "overview", label: "Overview", detail: "Metric-first monitoring" },
+    { id: "activity", label: "Activity", detail: "Feed and stdout" },
+    { id: "diff", label: "Diff", detail: "Code changes" },
+  ];
 
   function downloadMetricGraph() {
     const svg = chartRef.current?.querySelector("svg");
@@ -603,612 +704,333 @@ export default function Dashboard() {
 
   return (
     <div
-      className="min-h-screen bg-[var(--surface-0)] text-[var(--ink-strong)]"
+      className="min-h-screen bg-[var(--surface-0)] text-[var(--ink-strong)] font-sans selection:bg-[var(--accent)]/20"
       style={
         {
-          "--surface-0": "#f4efe6",
-          "--surface-1": "#fbf8f1",
-          "--surface-2": "#ece4d6",
-          "--ink-strong": "#16120d",
-          "--ink-soft": "#695f55",
-          "--line": "rgba(25,19,14,0.08)",
-          "--accent": "#9f7a42",
-          "--accent-soft": "#ead7b7",
-          "--good": "#2d8a5d",
-          "--bad": "#b95f5f",
+          "--surface-0": "#ffffff",
+          "--surface-1": "#fcfcfc",
+          "--surface-2": "#f0f0f0",
+          "--ink-strong": "#000000",
+          "--ink-soft": "#666666",
+          "--line": "#000000",
+          "--accent": "#000000",
+          "--accent-soft": "#f0f0f0",
+          "--good": "#000000",
+          "--bad": "#ff0000",
         } as CSSProperties
       }
     >
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(159,122,66,0.16),transparent_25%),radial-gradient(circle_at_bottom_right,rgba(45,138,93,0.10),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.72),rgba(244,239,230,0.92))]" />
-      <div className="relative mx-auto flex max-w-[1600px] flex-col gap-6 px-4 py-6 lg:px-8">
-        <header className="premium-panel premium-fade-up rounded-[36px] border border-black/5 bg-[linear-gradient(180deg,rgba(255,255,255,0.82),rgba(255,251,244,0.76))] p-6 shadow-[0_30px_80px_rgba(52,40,24,0.10)] backdrop-blur-xl">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-            <div>
-              <div className="flex items-center gap-3 text-xs uppercase tracking-[0.28em] text-[var(--ink-soft)]">
-                <Cable className="h-4 w-4 text-[var(--accent)]" />
-                AutoResearchUI
-              </div>
-              <h1 className="mt-4 max-w-4xl font-['Fraunces','Iowan_Old_Style',serif] text-4xl leading-[1.02] text-[var(--ink-strong)] lg:text-[5.25rem]">
-                Quietly watch the loop.
-                <span className="block text-[0.84em] text-[var(--ink-soft)]">Celebrate the ratchet when it moves.</span>
-              </h1>
-              <p className="mt-4 max-w-2xl text-sm leading-7 text-[var(--ink-soft)]">
-                Map one script, one log, and one metric. AutoResearchUI handles the live graph, experiment history, and process state.
+      <style dangerouslySetInnerHTML={{ __html: `
+        @font-face {
+          font-family: 'Editorial';
+          src: local('Georgia'), local('Times New Roman');
+        }
+        @keyframes premium-glitch {
+          0% { transform: translate(0); text-shadow: -2px 0 #ff00c1, 2px 0 #00fff9; }
+          2% { transform: translate(-2px, 2px); }
+          4% { transform: translate(-2px, -2px); }
+          6% { transform: translate(2px, 2px); }
+          8% { transform: translate(2px, -2px); }
+          10% { transform: translate(0); text-shadow: none; }
+          100% { transform: translate(0); text-shadow: none; }
+        }
+        .premium-glitch-text:hover {
+          animation: premium-glitch 0.5s cubic-bezier(.25,.46,.45,.94) both infinite;
+          cursor: pointer;
+        }
+        .vertical-text {
+          writing-mode: vertical-rl;
+          text-orientation: mixed;
+        }
+        input, select, button {
+          border-radius: 0 !important;
+        }
+        .sharp-border {
+          border: 1px solid var(--line);
+        }
+      ` }} />
+      <div className="relative flex min-h-screen w-full selection:bg-black selection:text-white">
+        {/* Editorial Logo (Top Left) */}
+        <div className="fixed left-0 top-0 z-50 flex h-16 w-16 items-center justify-center bg-black text-white">
+          <Cable className="h-6 w-6" />
+        </div>
+        <div className="fixed left-20 top-6 z-50 text-[10px] font-black tracking-[0.4em] text-black">
+          <span className="premium-glitch-text uppercase">Auto Research UI</span>
+        </div>
+
+        {/* Global Connection Status (Bottom Left) */}
+        <div className="fixed bottom-10 left-10 z-50 flex flex-col gap-2 text-[9px] font-bold tracking-[0.2em] text-black uppercase">
+          <div className="flex items-center gap-2">
+            <div className={`h-1.5 w-1.5 ${httpState === "live" ? "bg-black" : "bg-red-600"}`} /> HTTP / {httpState}
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`h-1.5 w-1.5 ${socketState === "live" ? "bg-black" : "bg-red-600"}`} /> WebSocket / {socketState}
+          </div>
+        </div>
+
+        {/* Vertical Editorial Nav (Right Edge) */}
+        <nav className="fixed right-10 top-0 z-50 flex h-full items-center justify-center">
+          <div className="flex flex-col gap-16">
+            {navItems.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setActiveView(item.id as any)}
+                className={`vertical-text group text-[11px] font-black tracking-[0.3em] uppercase transition-all duration-300 ${
+                  activeView === item.id ? "text-black scale-110" : "text-gray-300 hover:text-black"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </nav>
+
+        {/* Floating Social Hooks (Right Edge - Bottom) */}
+        <div className="fixed bottom-10 right-10 z-50 flex flex-col gap-6 text-black opacity-40">
+           <Bot className="h-4 w-4" />
+           <Activity className="h-4 w-4" />
+        </div>
+
+        {/* Main Editorial Canvas */}
+        <main className="flex-1 px-32 pb-32 pt-32 mx-auto w-full max-w-[1400px]">
+          {celebration ? (
+            <section className="mb-20 border-b border-black pb-10">
+              <p className="font-['Editorial',serif] text-[48px] leading-tight tracking-tighter text-black">
+                Locked: {formatMetric(celebration.value)}
               </p>
-            </div>
+              <p className="mt-2 text-xs font-bold uppercase tracking-[0.3em] text-gray-400">
+                Iteration #{celebration.iteration} / Improvement Found
+              </p>
+            </section>
+          ) : (
+            <section className="mb-20 border-b border-black pb-10">
+              <h1 className="font-['Editorial',serif] text-[64px] leading-[0.9] tracking-tighter text-black uppercase">
+                {activeView}
+              </h1>
+              <p className="mt-4 text-xs font-bold uppercase tracking-[0.4em] text-gray-500">
+                Research Loop / Control Interface v2.0
+              </p>
+            </section>
+          )}
 
-            <div className="flex flex-col gap-3">
-              <GhostButton onClick={() => setShowAdvanced((current) => !current)}>
-                {showAdvanced ? "Hide advanced view" : "Show advanced view"}
-              </GhostButton>
-              <div className="grid gap-3 sm:grid-cols-3">
-              <StatChip
-                label="HTTP"
-                value={httpState}
-                tone={httpState === "live" ? "good" : httpState === "checking" ? "neutral" : "bad"}
-              />
-              <StatChip
-                label="State API"
-                value={stateRouteState}
-                tone={stateRouteState === "live" ? "good" : stateRouteState === "checking" ? "neutral" : "bad"}
-              />
-              <StatChip
-                label="WebSocket"
-                value={socketState}
-                tone={socketState === "live" ? "good" : socketState === "checking" ? "neutral" : "bad"}
-              />
-              </div>
+          {error && (
+            <div className="mb-12 border border-red-600 p-6 text-xs font-bold uppercase tracking-widest text-red-600">
+              Exception: {error}
             </div>
-          </div>
-        </header>
+          )}
 
-        {celebration ? (
-          <section className="premium-panel premium-fade-up overflow-hidden rounded-[32px] border border-[var(--accent)]/20 bg-[linear-gradient(135deg,rgba(255,251,245,0.95),rgba(245,235,219,0.92))] p-5 shadow-[0_24px_60px_rgba(119,92,52,0.14)]">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-start gap-4">
-                <div className="premium-ring flex h-12 w-12 items-center justify-center rounded-full bg-[var(--accent)]/12 text-[var(--accent)]">
-                  <Sparkles className="h-5 w-5" />
-                </div>
-                <div>
-                  <p className="text-[11px] uppercase tracking-[0.26em] text-[var(--ink-soft)]">New best locked in</p>
-                  <h2 className="mt-1 font-['Fraunces','Iowan_Old_Style',serif] text-2xl text-[var(--ink-strong)]">
-                    Iteration #{celebration.iteration} improved {draft.y_axis_metric || "metric"} to {formatMetric(celebration.value)}.
-                  </h2>
-                  <p className="mt-2 text-sm text-[var(--ink-soft)]">
-                    Delta {formatMetric(celebration.delta)}. Keep the loop moving while the sidecar tracks the ratchet.
-                  </p>
-                </div>
-              </div>
-              <div className="rounded-full border border-[var(--accent)]/20 bg-white/60 px-4 py-2 text-sm text-[var(--ink-strong)]">
-                Best so far
-              </div>
-            </div>
-          </section>
-        ) : null}
-
-        <section className="premium-panel overflow-hidden rounded-[30px] border border-black/5 bg-[linear-gradient(180deg,rgba(255,255,255,0.76),rgba(255,250,241,0.70))] p-4 shadow-[0_24px_50px_rgba(44,33,20,0.08)]">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-3">
-              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[var(--ink-strong)] text-white">
-                <Waves className="h-5 w-5" />
-              </div>
-              <div>
-                <p className="text-[11px] uppercase tracking-[0.26em] text-[var(--ink-soft)]">Research status</p>
-                <p className="mt-1 text-sm text-[var(--ink-strong)]">
-                  {snapshot.process.status === "running"
-                    ? "The agent is running. Watch the graph and experiment feed update in real time."
-                    : "Pick the files once, then start the loop when you are ready."}
-                </p>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {loopStages.map((stage, index) => (
-                <div
-                  key={stage.title}
-                  className={`rounded-full border px-3 py-2 text-xs transition ${
-                    stage.current || (snapshot.process.status === "running" && index === loopStageIndex)
-                      ? "border-[var(--accent)]/35 bg-[var(--accent)]/12 text-[var(--ink-strong)]"
-                      : stage.active
-                        ? "border-black/8 bg-black/[0.03] text-[var(--ink-soft)]"
-                        : "border-black/6 bg-white/50 text-[var(--ink-soft)]/70"
-                  }`}
-                >
-                  <span className="font-medium">{stage.title}</span>
-                  <span className="ml-2 text-[var(--ink-soft)]">{stage.detail}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {showAdvanced ? (
-            <>
-              <div className="mt-5 grid gap-3 lg:grid-cols-5">
-                {loopStages.map((stage, index) => (
-                  <div key={`${stage.title}-track`} className="rounded-[22px] border border-black/6 bg-white/55 p-3">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`premium-stage-dot h-2.5 w-2.5 rounded-full ${
-                          stage.current || (snapshot.process.status === "running" && index === loopStageIndex)
-                            ? "bg-[var(--accent)] shadow-[0_0_0_6px_rgba(159,122,66,0.12)]"
-                            : stage.active
-                              ? "bg-[var(--ink-strong)]/55"
-                              : "bg-black/10"
-                        }`}
-                      />
-                      <div className="h-px flex-1 bg-[linear-gradient(90deg,rgba(159,122,66,0.26),rgba(22,18,13,0.05))]" />
-                    </div>
-                    <p className="mt-3 text-[11px] uppercase tracking-[0.2em] text-[var(--ink-soft)]">{stage.title}</p>
-                    <p className="mt-1 text-sm text-[var(--ink-strong)]">{stage.detail}</p>
+          <div className="grid gap-24 xl:grid-cols-[280px_minmax(0,1fr)]">
+            <aside className="space-y-16">
+              <div className="space-y-8">
+                <p className="text-[10px] font-black uppercase tracking-[0.3em] border-b border-black pb-2">Configuration</p>
+                <div className="space-y-6">
+                  <div>
+                    <label className="block text-[9px] font-bold uppercase tracking-widest text-gray-400">Workspace</label>
+                    <input
+                      value={projectRoot}
+                      onChange={(event) => setProjectRoot(event.target.value)}
+                      className="mt-2 w-full border-b border-gray-200 bg-transparent py-2 text-xs font-bold outline-none transition focus:border-black"
+                    />
                   </div>
-                ))}
-              </div>
 
-              <div className="premium-marquee mt-4 flex gap-3 whitespace-nowrap">
-                {[...activityItems, ...activityItems].map((item, index) => (
-                  <div key={`${item}-${index}`} className="inline-flex items-center gap-2 rounded-full border border-black/6 bg-white/70 px-4 py-2 text-sm text-[var(--ink-soft)]">
-                    <ArrowUpRight className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    {item}
-                  </div>
-                ))}
-              </div>
-            </>
-          ) : null}
-        </section>
-
-        {showAdvanced || snapshot.process.status === "running" || sessionFinished ? (
-        <section className="grid gap-4 lg:grid-cols-[1.15fr_0.85fr]">
-          <div className="premium-panel premium-sheen overflow-hidden rounded-[30px] border border-black/5 bg-[linear-gradient(180deg,rgba(255,255,255,0.78),rgba(255,249,239,0.72))] p-5 shadow-[0_20px_48px_rgba(44,33,20,0.08)]">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <div className="flex items-center gap-3">
-                  <span className={`premium-live-dot inline-flex h-2.5 w-2.5 rounded-full ${snapshot.process.status === "running" ? "bg-[var(--good)]" : "bg-[var(--accent)]"}`} />
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-[var(--ink-soft)]">
-                    {snapshot.process.status === "running" ? "Live research loop" : "Session telemetry"}
-                  </p>
-                </div>
-                <h2 className="mt-3 font-['Fraunces','Iowan_Old_Style',serif] text-2xl text-[var(--ink-strong)]">
-                  {snapshot.process.status === "running"
-                    ? "The sidecar is tracking every iteration in real time."
-                    : sessionFinished
-                      ? "The session has settled. The graph is ready to export."
-                      : "Map the project, then let the sidecar watch the ratchet."}
-                </h2>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--ink-soft)]">
-                  {snapshot.process.status === "running"
-                    ? compactText(snapshot.last_hypothesis || latestStdout || "The agent is cycling through edits, evaluations, and log updates.", 132)
-                    : sessionFinished
-                      ? compactText(latestStdout || snapshot.last_hypothesis || "Recent output has settled and the latest metric history is preserved in the UI.", 132)
-                      : "Once the run begins, this strip becomes the quiet status layer between code diffs, stdout, and metric changes."}
-                </p>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <MetricCard label="Iterations" value={iterationCount ? String(iterationCount) : "n/a"} />
-                <MetricCard label="Last metric" value={latestMetricPoint ? formatMetric(latestMetricPoint.metric) : "n/a"} />
-                <MetricCard label="Updated" value={formatDate(snapshot.last_updated)} />
-              </div>
-            </div>
-          </div>
-
-          <div className="premium-panel overflow-hidden rounded-[30px] border border-black/5 bg-[linear-gradient(180deg,rgba(255,255,255,0.76),rgba(252,246,236,0.82))] p-5 shadow-[0_20px_48px_rgba(44,33,20,0.07)]">
-            <div className="flex h-full flex-col justify-between gap-4">
-              <div>
-                <p className="text-[11px] uppercase tracking-[0.24em] text-[var(--ink-soft)]">
-                  {sessionFinished ? "Research session complete" : "Export moment"}
-                </p>
-                <h3 className="mt-3 font-['Fraunces','Iowan_Old_Style',serif] text-[1.8rem] leading-tight text-[var(--ink-strong)]">
-                  {sessionFinished ? "Archive the graph and keep the best run visible." : "The graph export unlocks as soon as the run has real metric history."}
-                </h3>
-                <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
-                  {sessionFinished
-                    ? `Best ${draft.y_axis_metric || "metric"}: ${bestMetric === null ? "n/a" : formatMetric(bestMetric)}. Use the export to share or pin the session outcome.`
-                    : "Once metric points arrive, the dashboard can save the live curve as an SVG without needing a screenshot."}
-                </p>
-              </div>
-
-              <div className="flex flex-col gap-3 sm:flex-row">
-                <ActionButton onClick={downloadMetricGraph} disabled={!sessionFinished || !chartData.length} icon={Download}>
-                  Download graph
-                </ActionButton>
-                <GhostButton onClick={() => void controlProcess("restart")} disabled={busy || !discovery?.git_present}>
-                  Restart loop
-                </GhostButton>
-              </div>
-            </div>
-          </div>
-        </section>
-        ) : null}
-
-        {error ? (
-          <div className="rounded-[24px] border border-rose-400/25 bg-rose-500/10 px-4 py-3 text-sm text-[var(--ink-strong)]">
-            {error}
-          </div>
-        ) : null}
-
-        <div className="grid gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
-          <aside className="space-y-6">
-            <Panel>
-              <PanelTitle icon={FolderSearch} title="Project Setup" subtitle="Choose the script, log file, and metric to track." />
-              {showAdvanced ? (
-                <div className="mt-5 rounded-2xl border border-black/6 bg-white/60 p-4 text-sm text-[var(--ink-soft)]">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="font-medium text-[var(--ink-strong)]">Connection checks</p>
-                    <GhostButton onClick={() => void runConnectionCheck()} disabled={busy}>
-                      Check Now
+                  <div className="flex gap-2">
+                    <ActionButton onClick={scanWorkspace} disabled={busy} icon={FolderSearch}>
+                      SCAN {">"}
+                    </ActionButton>
+                    <GhostButton onClick={applyMapping} disabled={busy || !draft.script_to_watch || !draft.log_file || !draft.y_axis_metric}>
+                      SYNC {">"}
                     </GhostButton>
                   </div>
-                  <div className="mt-3 grid gap-3 sm:grid-cols-3">
-                    <MetricCard label="HTTP health" value={httpState} />
-                    <MetricCard label="State route" value={stateRouteState} />
-                    <MetricCard label="Socket" value={socketState} />
+
+                  <FieldSelect
+                    label="Target Script"
+                    value={draft.script_to_watch}
+                    onChange={(value) =>
+                      setDraft((current) => ({
+                        ...current,
+                        project_root: projectRoot || current.project_root,
+                        script_to_watch: value,
+                        research_command: defaultCommandForScript(discovery, value) || current.research_command,
+                      }))
+                    }
+                    options={discovery?.script_candidates ?? []}
+                  />
+
+                  <FieldSelect
+                    label="Log Destination"
+                    value={draft.log_file}
+                    onChange={(value) => setDraft((current) => ({ ...current, log_file: value }))}
+                    options={discovery?.log_candidates ?? []}
+                  />
+
+                  <FieldSelect
+                    label="Primary Metric"
+                    value={draft.y_axis_metric}
+                    onChange={(value) => setDraft((current) => ({ ...current, y_axis_metric: value }))}
+                    options={headers}
+                  />
+
+                  <div className="space-y-4">
+                    <label className="text-[9px] font-bold uppercase tracking-widest text-gray-400">Optimization</label>
+                    <div className="flex flex-col gap-2">
+                      <GoalButton
+                        active={draft.optimization_goal === "minimize"}
+                        icon={TrendingDown}
+                        label="MIN"
+                        onClick={() => setDraft((current) => ({ ...current, optimization_goal: "minimize" }))}
+                      />
+                      <GoalButton
+                        active={draft.optimization_goal === "maximize"}
+                        icon={TrendingUp}
+                        label="MAX"
+                        onClick={() => setDraft((current) => ({ ...current, optimization_goal: "maximize" }))}
+                      />
+                    </div>
                   </div>
-                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <MetricCard label="Checked at" value={healthCheckedAt} />
-                    <MetricCard label="WS clients" value={health ? String(health.websocket_clients) : "n/a"} />
+
+                  <div>
+                    <label className="block text-[9px] font-bold uppercase tracking-widest text-gray-400">Runtime Command</label>
+                    <input
+                      value={draft.research_command ?? ""}
+                      onChange={(event) => setDraft((current) => ({ ...current, research_command: event.target.value }))}
+                      className="mt-2 w-full border-b border-gray-200 bg-transparent py-2 text-xs font-bold font-mono outline-none transition focus:border-black"
+                    />
                   </div>
                 </div>
-              ) : (
-                <div className="mt-5 rounded-2xl border border-black/6 bg-white/60 px-4 py-3 text-sm text-[var(--ink-soft)]">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <span className="text-[var(--ink-strong)]">System status</span>
-                    <div className="flex items-center gap-2">
-                      <InlineStatus label="HTTP" value={httpState} />
-                      <InlineStatus label="State" value={stateRouteState} />
-                      <InlineStatus label="Socket" value={socketState} />
+              </div>
+            </aside>
+
+            <div className="space-y-24">
+              {activeView === "overview" && (
+                <div className="space-y-20">
+                  <div className="grid gap-12 lg:grid-cols-[1fr_300px]">
+                    <div className="space-y-8">
+                      <div className="flex items-end justify-between border-b border-black pb-4">
+                        <p className="text-[10px] font-black uppercase tracking-[0.3em]">Metric Performance</p>
+                        <div className="flex gap-4">
+                          <button onClick={() => controlProcess("start")} disabled={busy || snapshot.process.status === "running"} className="text-[10px] font-black uppercase tracking-widest hover:underline disabled:opacity-20">Start Loop</button>
+                          <button onClick={() => controlProcess("stop")} disabled={busy || snapshot.process.status === "idle"} className="text-[10px] font-black uppercase tracking-widest hover:underline disabled:opacity-20">Halt</button>
+                        </div>
+                      </div>
+                      <div className="h-[400px] w-full border border-black p-8">
+                        {chartData.length ? (
+                          <ResponsiveContainer width="100%" height="100%">
+                            <LineChart data={chartData}>
+                              <CartesianGrid stroke="#eee" vertical={false} />
+                              <XAxis dataKey="iteration" hide />
+                              <YAxis axisLine={false} tickLine={false} stroke="#000" fontSize={10} fontWeight="bold" />
+                              <Tooltip contentStyle={{ border: '1px solid black', borderRadius: 0, padding: '10px' }} />
+                              <Line type="stepAfter" dataKey="metric" stroke="#000" strokeWidth={2} dot={{ r: 0 }} activeDot={{ r: 4, fill: '#000' }} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <div className="flex h-full items-center justify-center text-[10px] font-bold uppercase tracking-[0.2em] text-gray-300">
+                            Awaiting Data Stream
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="space-y-8">
+                      <p className="text-[10px] font-black uppercase tracking-[0.3em] border-b border-black pb-4">Record</p>
+                      <div className="divide-y divide-gray-100 max-h-[400px] overflow-y-auto">
+                        {deferredExperiments.length ? (
+                          deferredExperiments.slice().reverse().map((exp) => (
+                            <div key={`${exp.iteration}-${exp.timestamp}`} className="py-4">
+                              <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-widest">
+                                <span>Iter {exp.iteration}</span>
+                                <span className={exp.status === "KEPT" ? "text-black" : "text-gray-400"}>{exp.status}</span>
+                              </div>
+                              <div className="mt-1 font-['Editorial',serif] text-2xl tracking-tighter">
+                                {exp.metric_value?.toFixed(4) ?? '—'}
+                              </div>
+                            </div>
+                          ))
+                        ) : <p className="text-[10px] font-bold uppercase tracking-widest text-gray-300">No entries.</p>}
+                      </div>
                     </div>
                   </div>
                 </div>
               )}
 
-              <label className="mt-5 block text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">Project root</label>
-              <input
-                value={projectRoot}
-                onChange={(event) => setProjectRoot(event.target.value)}
-                placeholder={"c:\\projects\\autorresearch"}
-                className="mt-2 w-full rounded-2xl border border-black/8 bg-white/75 px-4 py-3 text-sm text-[var(--ink-strong)] outline-none transition focus:border-[var(--accent)]/50"
-              />
-
-              <div className="mt-3 flex gap-3">
-                <ActionButton onClick={scanWorkspace} disabled={busy} icon={FolderSearch}>
-                  Scan Workspace
-                </ActionButton>
-                <GhostButton onClick={applyMapping} disabled={busy || !draft.script_to_watch || !draft.log_file || !draft.y_axis_metric}>
-                  Apply
-                </GhostButton>
-              </div>
-
-              <FieldSelect
-                label="Script to watch"
-                value={draft.script_to_watch}
-                onChange={(value) =>
-                  setDraft((current) => ({
-                    ...current,
-                    project_root: projectRoot || current.project_root,
-                    script_to_watch: value,
-                    research_command: current.research_command || `python "${value}"`,
-                  }))
-                }
-                options={discovery?.script_candidates ?? []}
-              />
-
-              <FieldSelect
-                label="Log file"
-                value={draft.log_file}
-                onChange={(value) =>
-                  setDraft((current) => ({
-                    ...current,
-                    project_root: projectRoot || current.project_root,
-                    log_file: value,
-                    y_axis_metric: discovery?.headers_by_file[value]?.[0] ?? "",
-                  }))
-                }
-                options={discovery?.log_candidates ?? []}
-              />
-
-              <FieldSelect
-                label="Y-axis metric"
-                value={draft.y_axis_metric}
-                onChange={(value) => setDraft((current) => ({ ...current, y_axis_metric: value }))}
-                options={headers}
-              />
-
-              <div className="mt-5">
-                <label className="text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">Optimization goal</label>
-                <div className="mt-2 grid grid-cols-2 gap-2">
-                  <GoalButton
-                    active={draft.optimization_goal === "minimize"}
-                    icon={TrendingDown}
-                    label="Minimize"
-                    onClick={() => setDraft((current) => ({ ...current, optimization_goal: "minimize" }))}
-                  />
-                  <GoalButton
-                    active={draft.optimization_goal === "maximize"}
-                    icon={TrendingUp}
-                    label="Maximize"
-                    onClick={() => setDraft((current) => ({ ...current, optimization_goal: "maximize" }))}
-                  />
-                </div>
-              </div>
-
-              <label className="mt-5 block text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">Research command</label>
-              <input
-                value={draft.research_command ?? ""}
-                onChange={(event) => setDraft((current) => ({ ...current, research_command: event.target.value }))}
-                placeholder={'python "run_agent.py"'}
-                className="mt-2 w-full rounded-2xl border border-black/8 bg-white/75 px-4 py-3 text-sm text-[var(--ink-strong)] outline-none transition focus:border-[var(--accent)]/50"
-              />
-
-              <div className="mt-5 rounded-2xl border border-black/6 bg-white/60 p-4 text-sm text-[var(--ink-soft)]">
-                <p className="font-medium text-[var(--ink-strong)]">Git check</p>
-                <p className="mt-2 leading-6">
-                  {discovery?.git_present
-                    ? `Git detected at ${discovery.git_root}. You can start and restart safely.`
-                    : "No Git repository detected yet. The backend will refuse code-modifying process starts."}
-                </p>
-              </div>
-            </Panel>
-
-            {showAdvanced ? (
-            <Panel>
-              <PanelTitle icon={GitCommitHorizontal} title="Recent Commits" subtitle="Latest repository state from GitPython." />
-              <div className="mt-5 space-y-3">
-                {(discovery?.recent_commits ?? []).length ? (
-                  discovery?.recent_commits.map((commit) => (
-                    <div key={commit.sha} className="rounded-2xl border border-black/6 bg-white/60 p-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="font-mono text-xs text-[var(--accent)]">{commit.sha}</span>
-                        <span className="text-xs text-[var(--ink-soft)]">{formatDate(commit.authored_at)}</span>
-                      </div>
-                      <p className="mt-2 text-sm text-[var(--ink-strong)]">{commit.summary}</p>
-                    </div>
-                  ))
-                ) : (
-                  <p className="text-sm text-[var(--ink-soft)]">No commit metadata available yet.</p>
-                )}
-              </div>
-            </Panel>
-            ) : null}
-          </aside>
-
-          <main className="space-y-6">
-            <section className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
-              <Panel className="min-h-[420px]">
-                <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
-                  <PanelTitle
-                    icon={Activity}
-                    title="Live Metric"
-                    subtitle={`Watching ${draft.y_axis_metric || "your selected metric"} as new log rows arrive.`}
-                  />
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                    <ControlButton
-                      label="Start"
-                      icon={Play}
-                      onClick={() => controlProcess("start")}
-                      disabled={busy || !discovery?.git_present || snapshot.process.status === "running"}
-                    />
-                    <ControlButton
-                      label="Stop"
-                      icon={Pause}
-                      onClick={() => controlProcess("stop")}
-                      disabled={busy || snapshot.process.status === "idle"}
-                    />
-                    <ControlButton
-                      label="Restart"
-                      icon={RefreshCcw}
-                      onClick={() => controlProcess("restart")}
-                      disabled={busy || !discovery?.git_present}
-                    />
-                    <ControlButton
-                      label="Graph"
-                      icon={Download}
-                      onClick={downloadMetricGraph}
-                      disabled={!chartData.length}
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-6 grid gap-4 md:grid-cols-3">
-                  <MetricCard label="Process PID" value={snapshot.process.pid ? String(snapshot.process.pid) : "n/a"} />
-                  <MetricCard label="Process" value={snapshot.process.status} />
-                  <MetricCard label="Best" value={bestMetric === null ? "n/a" : `${draft.y_axis_metric || "metric"} ${bestMetric.toFixed(4)}`} />
-                </div>
-
-                <div
-                  ref={chartRef}
-                  className="mt-6 h-[280px] overflow-hidden rounded-[28px] border border-black/5 bg-[linear-gradient(180deg,rgba(255,255,255,0.88),rgba(251,248,241,0.94))] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]"
-                >
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-[20px] border border-black/5 bg-white/60 px-3 py-2">
-                    <div className="flex items-center gap-3">
-                      <span className={`premium-live-dot inline-flex h-2.5 w-2.5 rounded-full ${snapshot.process.status === "running" ? "bg-[var(--good)]" : "bg-[var(--accent)]"}`} />
-                      <p className="text-xs text-[var(--ink-soft)]">
-                        {snapshot.process.status === "running"
-                          ? `Watching ${draft.y_axis_metric || "metric"} in real time`
-                          : sessionFinished
-                            ? "Session settled. Export-ready."
-                            : "Waiting for the first metric points"}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                      <span>{chartData.length} points</span>
-                      <span className="h-1 w-1 rounded-full bg-black/15" />
-                      <span>{formatDate(snapshot.last_updated)}</span>
+              {activeView === "activity" && (
+                <div className="grid gap-20 lg:grid-cols-[1fr_400px]">
+                  <div className="space-y-10">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em] border-b border-black pb-4">Thought Timeline</p>
+                    <div className="space-y-12">
+                      {deferredExperiments.length ? (
+                        deferredExperiments.slice().reverse().map((exp) => (
+                          <div key={`${exp.iteration}-${exp.timestamp}`} className="group">
+                             <div className="flex items-center gap-4 text-[10px] font-black uppercase tracking-[0.2em] mb-4">
+                                <span className="bg-black text-white px-2 py-1">Iteration {exp.iteration}</span>
+                                <span className="text-gray-400">{hasMounted ? formatDate(exp.timestamp) : "..."}</span>
+                             </div>
+                             <p className="font-['Editorial',serif] text-3xl leading-tight tracking-tight text-black group-hover:italic transition-all">
+                               "{exp.hypothesis || "Exploration in progress."}"
+                             </p>
+                          </div>
+                        ))
+                      ) : <p className="text-gray-300 italic">No activity logs recorded.</p>}
                     </div>
                   </div>
 
-                  {chartData.length ? (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={chartData} margin={{ left: 8, right: 24, top: 12, bottom: 12 }}>
-                        <CartesianGrid stroke="rgba(22,18,13,0.06)" vertical={false} />
-                        <XAxis dataKey="iteration" tickLine={false} axisLine={false} stroke="#8d877f" />
-                        <YAxis tickLine={false} axisLine={false} stroke="#8d877f" width={80} />
-                        <Tooltip
-                          contentStyle={{
-                            background: "#fffaf1",
-                            border: "1px solid rgba(25,19,14,0.08)",
-                            borderRadius: 18,
-                            color: "#16120d",
-                            boxShadow: "0 20px 40px rgba(44,33,20,0.10)",
-                          }}
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="metric"
-                          stroke="var(--accent)"
-                          strokeWidth={2.5}
-                          dot={false}
-                          activeDot={{ r: 5, strokeWidth: 0, fill: "#f7d39f" }}
-                        />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : (
-                    <EmptyState
-                      title="No metric points yet"
-                      body="Apply a mapping and stream a log file. The chart will follow new rows without reloading the entire file."
-                    />
-                  )}
+                  <div className="space-y-10">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em] border-b border-black pb-4">Terminal</p>
+                    <div className="h-[600px] overflow-y-auto border border-black p-6 font-mono text-[10px] leading-relaxed text-black bg-[#fafafa]">
+                      {snapshot.stdout_tail.length ? (
+                        snapshot.stdout_tail.map((line, idx) => <div key={idx} className="mb-1">{line}</div>)
+                      ) : (
+                        <p className="text-gray-300">Awaiting stream...</p>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </Panel>
+              )}
 
-              <Panel className="min-h-[420px]">
-                <PanelTitle
-                  icon={SquareTerminal}
-                  title="Experiment Feed"
-                  subtitle="Each iteration is labeled as kept or discarded and paired with its reasoning."
-                />
-                <div className="mt-5 max-h-[340px] space-y-3 overflow-y-auto pr-1">
-                  {deferredExperiments.length ? (
-                    deferredExperiments
-                      .slice()
-                      .reverse()
-                      .map((experiment) => (
-                        <article key={`${experiment.iteration}-${experiment.timestamp}`} className="premium-panel rounded-[24px] border border-black/6 bg-white/65 p-4">
-                          <div className="flex items-center justify-between gap-3">
-                            <div>
-                              <p className="text-sm font-medium text-[var(--ink-strong)]">Iteration #{experiment.iteration}</p>
-                              <p className="mt-1 text-xs text-[var(--ink-soft)]">{formatDate(experiment.timestamp)}</p>
-                            </div>
-                            <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold tracking-[0.18em] ${getStatusTone(experiment.status)}`}>
-                              {experiment.status}
-                            </span>
-                          </div>
-
-                          <div className="mt-4 grid grid-cols-2 gap-3">
-                            <MetricCard label={experiment.metric_name} value={experiment.metric_value === null ? "n/a" : experiment.metric_value.toFixed(4)} />
-                            <MetricCard label="Raw keys" value={String(Object.keys(experiment.raw).length)} />
-                          </div>
-
-                          <div className="mt-4 rounded-2xl border border-black/6 bg-[var(--surface-1)] p-4">
-                            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                              <Bot className="h-4 w-4 text-[var(--accent)]" />
-                              Agent reasoning
-                            </div>
-                            <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
-                              {experiment.hypothesis || snapshot.last_hypothesis || "No explicit hypothesis found in log rows or stdout yet."}
-                            </p>
-                          </div>
-                        </article>
-                      ))
-                  ) : (
-                    <EmptyState
-                      title="No experiments yet"
-                      body="The feed populates once the sidecar sees appended log rows or stdout-derived reasoning."
-                    />
-                  )}
-                </div>
-              </Panel>
-            </section>
-
-            {showAdvanced ? (
-            <section className="grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
-              <Panel className="min-h-[480px]">
-                <PanelTitle
-                  icon={GitCommitHorizontal}
-                  title="Code Diff"
-                  subtitle={snapshot.diff.path ? snapshot.diff.path : "Watching the selected file for the current experiment delta."}
-                />
-                <div className="mt-5 overflow-hidden rounded-[24px] border border-black/6 bg-[#f8f4ec]">
-                  {snapshot.diff.path ? (
-                    <DiffViewer
-                      oldValue={snapshot.diff.before}
-                      newValue={snapshot.diff.after}
-                      splitView
-                      hideLineNumbers={false}
-                      showDiffOnly={false}
-                      styles={{
-                        variables: {
-                          dark: {
-                            diffViewerBackground: "#f8f4ec",
-                            diffViewerColor: "#16120d",
-                            addedBackground: "rgba(45,138,93,0.10)",
-                            addedColor: "#1e5b3d",
-                            removedBackground: "rgba(185,95,95,0.10)",
-                            removedColor: "#7f3f3f",
-                            wordAddedBackground: "rgba(45,138,93,0.16)",
-                            wordRemovedBackground: "rgba(185,95,95,0.16)",
-                            addedGutterBackground: "rgba(45,138,93,0.08)",
-                            removedGutterBackground: "rgba(185,95,95,0.08)",
-                            gutterBackground: "#efe6d7",
-                            gutterBackgroundDark: "#efe6d7",
-                            highlightBackground: "rgba(159,122,66,0.08)",
-                            highlightGutterBackground: "rgba(159,122,66,0.08)",
-                            codeFoldGutterBackground: "#efe6d7",
-                            codeFoldBackground: "#efe6d7",
-                            emptyLineBackground: "#f8f4ec",
-                            gutterColor: "#80705f",
-                            addedGutterColor: "#2d8a5d",
-                            removedGutterColor: "#b95f5f",
-                            codeFoldContentColor: "#695f55",
+              {activeView === "diff" && (
+                <div className="space-y-10">
+                  <div className="flex items-end justify-between border-b border-black pb-4">
+                    <p className="text-[10px] font-black uppercase tracking-[0.3em]">Code Delta</p>
+                    <p className="text-[10px] font-bold uppercase text-gray-400">{snapshot.diff.path || 'No file selected'}</p>
+                  </div>
+                  <div className="border border-black bg-white overflow-hidden">
+                    {snapshot.diff.path ? (
+                      <DiffViewer
+                        oldValue={snapshot.diff.before}
+                        newValue={snapshot.diff.after}
+                        splitView
+                        styles={{
+                          variables: {
+                            light: {
+                              diffViewerBackground: "#fff",
+                              addedBackground: "rgba(0,0,0,0.05)",
+                              removedBackground: "rgba(255,0,0,0.05)",
+                              gutterBackground: "#fff",
+                              gutterColor: "#000",
+                              codeFoldBackground: "#f9f9f9",
+                            }
                           },
-                        },
-                        contentText: {
-                          fontSize: "13px",
-                          lineHeight: 1.7,
-                          fontFamily: '"IBM Plex Mono", "SFMono-Regular", Consolas, monospace',
-                        },
-                      }}
-                    />
-                  ) : (
-                    <EmptyState
-                      title="No diff available"
-                      body="Once the watched file changes, the dashboard keeps the prior snapshot and renders the current iteration side by side."
-                    />
-                  )}
-                </div>
-              </Panel>
-
-              <Panel className="min-h-[480px]">
-                <PanelTitle
-                  icon={SquareTerminal}
-                  title="Stdout Trace"
-                  subtitle="Recent process output, useful when hypotheses are emitted outside structured logs."
-                />
-                <div className="mt-5 h-[380px] overflow-y-auto rounded-[24px] border border-black/6 bg-[#f7f2e9] p-4 font-mono text-xs leading-6 text-[var(--ink-soft)]">
-                  {snapshot.stdout_tail.length ? (
-                    snapshot.stdout_tail.map((line, index) => (
-                      <div key={`${index}-${line.slice(0, 18)}`} className="border-b border-black/5 py-2 last:border-b-0">
-                        {line}
+                          contentText: { fontSize: "12px", lineHeight: 2, fontFamily: 'monospace' }
+                        }}
+                      />
+                    ) : (
+                      <div className="flex h-[400px] items-center justify-center text-[10px] font-bold uppercase tracking-widest text-gray-300">
+                        No Code Changes Detected
                       </div>
-                    ))
-                  ) : (
-                    <p className="text-[var(--ink-soft)]">No process output yet.</p>
-                  )}
+                    )}
+                  </div>
                 </div>
-
-                <div className="mt-5 rounded-[24px] border border-black/6 bg-white/60 p-4">
-                  <p className="text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">Current command</p>
-                  <p className="mt-2 break-all text-sm text-[var(--ink-strong)]">{snapshot.process.command || draft.research_command || "n/a"}</p>
-                </div>
-              </Panel>
-            </section>
-            ) : null}
-          </main>
-        </div>
+              )}
+            </div>
+          </div>
+        </main>
       </div>
 
-      {loading ? (
-        <div className="fixed inset-x-0 bottom-6 mx-auto w-fit rounded-full border border-black/8 bg-white/85 px-4 py-2 text-xs uppercase tracking-[0.22em] text-[var(--ink-soft)] backdrop-blur">
-          Syncing backend state...
+      {loading && (
+        <div className="fixed inset-x-0 bottom-8 mx-auto w-fit border border-black bg-white px-6 py-3 text-[9px] font-black uppercase tracking-[0.3em] text-black shadow-2xl z-[100]">
+          Synchronizing State...
         </div>
-      ) : null}
+      )}
     </div>
   );
 }
@@ -1221,53 +1043,70 @@ function Panel({
   className?: string;
 }) {
   return (
-    <section className={`premium-panel rounded-[32px] border border-black/6 bg-[linear-gradient(180deg,rgba(255,255,255,0.78),rgba(255,250,241,0.72))] p-5 shadow-[0_24px_60px_rgba(44,33,20,0.08)] backdrop-blur-xl ${className}`}>
+    <section className={`border border-black bg-white p-8 ${className}`}>
       {children}
     </section>
   );
 }
 
 function PanelTitle({
-  icon: Icon,
   title,
   subtitle,
 }: {
-  icon: ComponentType<{ className?: string }>;
+  icon?: any;
   title: string;
   subtitle: string;
 }) {
   return (
-    <div>
-      <div className="flex items-center gap-3 text-xs uppercase tracking-[0.2em] text-[var(--ink-soft)]">
-        <Icon className="h-4 w-4 text-[var(--accent)]" />
-        {title}
-      </div>
-      <p className="mt-3 font-['Fraunces','Iowan_Old_Style',serif] text-2xl text-[var(--ink-strong)]">{title}</p>
-      <p className="mt-2 max-w-2xl text-sm leading-6 text-[var(--ink-soft)]">{subtitle}</p>
+    <div className="mb-8">
+      <p className="font-['Editorial',serif] text-3xl leading-none tracking-tight text-black uppercase">{title}</p>
+      <p className="mt-2 text-[10px] font-bold uppercase tracking-[0.2em] text-gray-400">{subtitle}</p>
     </div>
   );
 }
 
-function StatChip({
+function MetricCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="border border-black bg-white p-6">
+      <p className="text-[9px] font-bold uppercase tracking-widest text-gray-400">{label}</p>
+      <p className="mt-2 text-xl font-black tracking-tight text-black">{value}</p>
+    </div>
+  );
+}
+
+function InlineStatus({
   label,
   value,
-  tone,
 }: {
   label: string;
   value: string;
-  tone: "good" | "bad" | "neutral";
 }) {
-  const tones = {
-    good: "border-emerald-500/20 bg-emerald-500/10 text-[var(--ink-strong)]",
-    bad: "border-rose-500/20 bg-rose-500/10 text-[var(--ink-strong)]",
-    neutral: "border-black/6 bg-white/60 text-[var(--ink-strong)]",
-  };
-
   return (
-    <div className={`premium-panel rounded-[24px] border px-4 py-3 ${tones[tone]}`}>
-      <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">{label}</p>
-      <p className="mt-2 text-sm font-medium">{value}</p>
-    </div>
+    <span className="inline-flex items-center border border-black px-2 py-1 text-[9px] font-black uppercase tracking-widest text-black">
+      {label}: {value}
+    </span>
+  );
+}
+
+function ControlButton({
+  label,
+  onClick,
+  disabled,
+}: {
+  label: string;
+  icon?: any;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="border border-black bg-black px-4 py-2 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white hover:text-black disabled:opacity-20"
+    >
+      {label} {">"}
+    </button>
   );
 }
 
@@ -1275,21 +1114,19 @@ function ActionButton({
   children,
   onClick,
   disabled,
-  icon: Icon,
 }: {
   children: ReactNode;
   onClick: () => void;
   disabled?: boolean;
-  icon: ComponentType<{ className?: string }>;
+  icon: any;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="premium-button inline-flex items-center gap-2 rounded-2xl bg-[var(--accent)] px-4 py-3 text-sm font-medium text-black disabled:cursor-not-allowed disabled:opacity-45"
+      className="inline-flex items-center justify-center border border-black bg-black px-4 py-2 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white hover:text-black disabled:opacity-20"
     >
-      <Icon className="h-4 w-4" />
       {children}
     </button>
   );
@@ -1309,9 +1146,32 @@ function GhostButton({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className="premium-subtle-button inline-flex items-center justify-center rounded-2xl border border-black/8 bg-white/55 px-4 py-3 text-sm text-[var(--ink-strong)] disabled:cursor-not-allowed disabled:opacity-45"
+      className="inline-flex items-center justify-center border border-black px-4 py-2 text-[10px] font-black uppercase tracking-widest text-black transition hover:bg-black hover:text-white disabled:opacity-20"
     >
       {children}
+    </button>
+  );
+}
+
+function GoalButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: any;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`border px-4 py-2 text-[10px] font-black uppercase tracking-widest transition ${
+        active ? "border-black bg-black text-white" : "border-gray-200 text-gray-400 hover:border-black hover:text-black"
+      }`}
+    >
+      {label}
     </button>
   );
 }
@@ -1328,14 +1188,14 @@ function FieldSelect({
   options: string[];
 }) {
   return (
-    <div className="mt-5">
-      <label className="text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">{label}</label>
+    <div className="space-y-2">
+      <label className="text-[9px] font-bold uppercase tracking-widest text-gray-400">{label}</label>
       <select
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="mt-2 w-full rounded-2xl border border-black/8 bg-white/70 px-4 py-3 text-sm text-[var(--ink-strong)] outline-none transition duration-300 ease-out focus:border-[var(--accent)]/50 focus:bg-white"
+        className="w-full border-b border-gray-200 bg-transparent py-2 text-xs font-bold outline-none transition focus:border-black appearance-none"
       >
-        {!value ? <option value="">Select {label.toLowerCase()}</option> : null}
+        {!value ? <option value="">Select {label}</option> : null}
         {options.map((option) => (
           <option key={option} value={option}>
             {option}
@@ -1343,84 +1203,5 @@ function FieldSelect({
         ))}
       </select>
     </div>
-  );
-}
-
-function GoalButton({
-  active,
-  icon: Icon,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  icon: ComponentType<{ className?: string }>;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`premium-subtle-button flex items-center justify-center gap-2 rounded-2xl border px-4 py-3 text-sm ${
-        active ? "border-[var(--accent)]/45 bg-[var(--accent)]/14 text-[var(--ink-strong)]" : "border-black/8 bg-white/55 text-[var(--ink-soft)]"
-      }`}
-    >
-      <Icon className="h-4 w-4" />
-      {label}
-    </button>
-  );
-}
-
-function ControlButton({
-  label,
-  icon: Icon,
-  onClick,
-  disabled,
-}: {
-  label: string;
-  icon: ComponentType<{ className?: string }>;
-  onClick: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className="premium-subtle-button inline-flex items-center justify-center gap-2 rounded-2xl border border-black/8 bg-white/60 px-4 py-3 text-sm text-[var(--ink-strong)] disabled:cursor-not-allowed disabled:opacity-45"
-    >
-      <Icon className="h-4 w-4" />
-      {label}
-    </button>
-  );
-}
-
-function MetricCard({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="premium-panel rounded-[24px] border border-black/6 bg-white/60 p-4">
-      <p className="text-[11px] uppercase tracking-[0.18em] text-[var(--ink-soft)]">{label}</p>
-      <p className="mt-2 text-sm text-[var(--ink-strong)]">{value}</p>
-    </div>
-  );
-}
-
-function InlineStatus({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  const tone =
-    value === "live"
-      ? "bg-emerald-500/12 text-[var(--good)]"
-      : value === "offline"
-        ? "bg-rose-500/12 text-[var(--bad)]"
-        : "bg-black/[0.05] text-[var(--ink-soft)]";
-
-  return (
-    <span className={`rounded-full px-3 py-1 text-xs ${tone}`}>
-      {label}: {value}
-    </span>
   );
 }

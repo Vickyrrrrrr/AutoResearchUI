@@ -20,7 +20,7 @@ from git import InvalidGitRepositoryError, NoSuchPathError, Repo
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_BACKEND_HOST = "127.0.0.1"
 DEFAULT_BACKEND_PORT = 8000
-DEFAULT_FRONTEND_HOST = "localhost"
+DEFAULT_FRONTEND_HOST = "127.0.0.1"
 DEFAULT_FRONTEND_PORT = 3000
 HEALTH_TIMEOUT_SECONDS = 45
 
@@ -43,7 +43,16 @@ def parse_args() -> argparse.Namespace:
         description="Launch AutoResearchUI against the current Git repository or an explicit project path.",
     )
     parser.add_argument("--project-root", help="Explicit path to the project to monitor. Defaults to the current Git repo.")
-    parser.add_argument("--non-interactive", action="store_true", help="Do not prompt for mapping; use auto-detected defaults when possible.")
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Keep the auto-detected mapping without prompting. This is now the default behavior.",
+    )
+    parser.add_argument(
+        "--interactive-mapping",
+        action="store_true",
+        help="Prompt for script, log file, metric, and command instead of using the detected mapping.",
+    )
     parser.add_argument("--backend-host", default=DEFAULT_BACKEND_HOST)
     parser.add_argument("--backend-port", default=DEFAULT_BACKEND_PORT, type=int)
     parser.add_argument("--frontend-host", default=DEFAULT_FRONTEND_HOST)
@@ -154,12 +163,16 @@ def bootstrap_target_repo(project_root: Path) -> None:
         run_bootstrap([npm_executable, "install"], cwd=project_root, label="project Node deps")
 
 
-def prepend_vendor(env: dict[str, str]) -> dict[str, str]:
-    vendor_path = APP_ROOT / ".vendor"
-    if not vendor_path.exists():
-        return env
-    current = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(vendor_path) if not current else os.pathsep.join([str(vendor_path), current])
+def build_runtime_env() -> dict[str, str]:
+    env = os.environ.copy()
+    # Local vendored dependencies are for repository-side testing only.
+    # End-user runs should rely on the active interpreter environment so
+    # compiled wheels like pydantic_core match the user's Python version.
+    if os.getenv("AUTORESEARCH_USE_VENDOR") == "1":
+        vendor_path = APP_ROOT / ".vendor"
+        if vendor_path.exists():
+            current = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = str(vendor_path) if not current else os.pathsep.join([str(vendor_path), current])
     return env
 
 
@@ -194,6 +207,37 @@ def wait_for_port(host: str, port: int, timeout_seconds: int) -> None:
     raise SystemExit(f"Timed out waiting for {host}:{port}")
 
 
+def frontend_ready_urls(host: str, port: int) -> list[str]:
+    candidates = [f"http://{host}:{port}"]
+    if host == "127.0.0.1":
+        candidates.append(f"http://localhost:{port}")
+    elif host == "localhost":
+        candidates.append(f"http://127.0.0.1:{port}")
+    return candidates
+
+
+def wait_for_frontend(process: subprocess.Popen[str], host: str, port: int, timeout_seconds: int) -> str:
+    urls = frontend_ready_urls(host, port)
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise SystemExit(
+                f"Frontend process exited early with code {process.returncode}. "
+                "Run `npm install` in the AutoResearchUI repo and retry."
+            )
+        for url in urls:
+            with suppress(urllib.error.URLError, TimeoutError):
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    if 200 <= response.status < 500:
+                        return url
+        time.sleep(0.5)
+    joined = " or ".join(urls)
+    raise SystemExit(
+        f"Timed out waiting for the web UI at {joined}. "
+        f"Try `autoresearchui --frontend-host 127.0.0.1 --frontend-port {port}`."
+    )
+
+
 def start_backend(
     project_root: Path,
     host: str,
@@ -201,7 +245,7 @@ def start_backend(
     auto_config: bool,
     allowed_origins: str,
 ) -> subprocess.Popen[str]:
-    env = prepend_vendor(os.environ.copy())
+    env = build_runtime_env()
     env["AUTORESEARCH_AUTO_PROJECT_ROOT"] = str(project_root)
     env["AUTORESEARCH_AUTO_CONFIG"] = "1" if auto_config else "0"
     env["AUTORESEARCH_ALLOWED_ORIGINS"] = allowed_origins
@@ -347,15 +391,20 @@ def prompt_goal(default_goal: str) -> str:
     raise SystemExit(f"Invalid optimization goal: {response}")
 
 
-def build_mapping(project_root: Path, non_interactive: bool) -> dict[str, object] | None:
+def build_mapping(project_root: Path, interactive: bool) -> dict[str, object] | None:
     ProjectScanner, AutoMapper, MappingConfig = load_repo_models()
     discovery = ProjectScanner.discover(project_root)
     suggested = AutoMapper.build_config(discovery)
 
-    if non_interactive or not sys.stdin.isatty():
-        if not suggested:
-            return None
-        return suggested.model_dump()
+    if not interactive or not sys.stdin.isatty():
+        if suggested:
+            print("[autoresearchui] Auto-detected project mapping.")
+            print(f"[autoresearchui] Script: {relative_to_project(project_root, suggested.script_to_watch)}")
+            print(f"[autoresearchui] Log file: {relative_to_project(project_root, suggested.log_file)}")
+            print(f"[autoresearchui] Metric: {suggested.y_axis_metric} ({suggested.optimization_goal})")
+            return suggested.model_dump()
+        print("[autoresearchui] Could not confidently auto-map the repo. Launching the backend and UI without a pinned mapping.")
+        return None
 
     print("\n[autoresearchui] Review the detected project mapping.")
     print("[autoresearchui] Press Enter to accept the default selection shown in each prompt.\n")
@@ -369,8 +418,9 @@ def build_mapping(project_root: Path, non_interactive: bool) -> dict[str, object
     headers = discovery.headers_by_file.get(log_file)
     if headers is None:
         headers = ProjectScanner.infer_headers(Path(log_file))
-    default_metric = suggested.y_axis_metric if suggested and suggested.log_file == log_file else AutoMapper.pick_metric(headers or [])
-    y_axis_metric = prompt_value_choice("Y-axis metric", headers or [], default_metric)
+    metric_options = headers or discovery.suggested_metrics
+    default_metric = suggested.y_axis_metric if suggested and suggested.log_file == log_file else AutoMapper.pick_metric(metric_options or [])
+    y_axis_metric = prompt_value_choice("Y-axis metric", metric_options or [], default_metric)
 
     default_goal = suggested.optimization_goal if suggested and suggested.y_axis_metric == y_axis_metric else AutoMapper.infer_goal(y_axis_metric)
     optimization_goal = prompt_goal(default_goal)
@@ -435,7 +485,8 @@ def main() -> int:
 
     try:
         if not args.frontend_only:
-            selected_mapping = build_mapping(trusted_root, non_interactive=args.non_interactive)
+            should_prompt_for_mapping = args.interactive_mapping and not args.bootstrap_project
+            selected_mapping = build_mapping(trusted_root, interactive=should_prompt_for_mapping)
             backend_process = start_backend(
                 project_root=trusted_root,
                 host=args.backend_host,
@@ -457,18 +508,20 @@ def main() -> int:
                 backend_host=args.backend_host,
                 backend_port=args.backend_port,
             )
-            wait_for_port(args.frontend_host, args.frontend_port, HEALTH_TIMEOUT_SECONDS)
-            print(f"[autoresearchui] UI ready at http://{args.frontend_host}:{args.frontend_port}")
+            frontend_url = wait_for_frontend(frontend_process, args.frontend_host, args.frontend_port, HEALTH_TIMEOUT_SECONDS)
+            print(f"[autoresearchui] UI ready at {frontend_url}")
             if not args.no_open_browser:
                 with suppress(Exception):
-                    webbrowser.open(f"http://{args.frontend_host}:{args.frontend_port}", new=2)
+                    webbrowser.open(frontend_url, new=2)
 
         if args.frontend_only:
             print("[autoresearchui] Frontend-only mode enabled.")
-        elif selected_mapping:
+        elif args.interactive_mapping and selected_mapping:
             print("[autoresearchui] Interactive mapping enabled. The selected repo files were applied before the UI opened.")
+        elif selected_mapping:
+            print("[autoresearchui] Auto-mapping enabled. The detected repo files were applied before the UI opened.")
         else:
-            print("[autoresearchui] Auto-detection enabled. The backend starts with the detected repo pre-mapped when possible.")
+            print("[autoresearchui] Auto-detection enabled. Finish the mapping in the UI if the repo could not be pinned automatically.")
         print("[autoresearchui] Press Ctrl+C to stop.")
 
         while True:

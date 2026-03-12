@@ -16,6 +16,43 @@ AutoResearchUI combines three pieces:
 
 It is designed for researchers, builders, and open-source teams running iterative loops inside their own repositories.
 
+## For First-Time Users
+
+If you are new to this project, the most important thing to understand is that there are two separate repos involved:
+
+- `AutoResearchUI`: the tool you install once
+- `your research repo`: the project AutoResearchUI watches
+
+AutoResearchUI does not need to be copied into your research repo.
+
+Instead, the normal model is:
+
+1. clone and install AutoResearchUI once on your machine
+2. go into your own research repo
+3. run `autoresearchui`
+
+So the tool lives in one folder, and you use it from another folder.
+
+### Beginner Example
+
+First, install AutoResearchUI once:
+
+```powershell
+git clone <your-autoresearchui-repo-url>
+cd AutoResearchUI
+python -m pip install -e .
+npm install
+```
+
+Then, every time you want to use it on a research repo:
+
+```powershell
+cd C:\path\to\your-research-repo
+autoresearchui
+```
+
+That is the intended beginner workflow.
+
 ## Why AutoResearchUI
 
 Research loops usually have good execution and poor visibility.
@@ -35,7 +72,7 @@ AutoResearchUI gives that loop a dedicated interface:
 ## Features
 
 - Repo-aware CLI startup from the current Git repository
-- Interactive mapping flow for script, log file, metric, optimization goal, and research command
+- Auto-detected project mapping for script, log file, metric, and optimization goal
 - Real-time metric chart backed by incremental `.csv`, `.tsv`, and `.json` tailing
 - Experiment feed with `KEPT`, `DISCARDED`, and reasoning context
 - Side-by-side watched-file diff viewer
@@ -47,9 +84,11 @@ AutoResearchUI gives that loop a dedicated interface:
 
 ## Quickstart
 
-Install AutoResearchUI:
+Install AutoResearchUI once:
 
 ```powershell
+git clone <your-autoresearchui-repo-url>
+cd AutoResearchUI
 python -m pip install -e .
 npm install
 ```
@@ -65,9 +104,9 @@ AutoResearchUI will:
 
 - detect the current Git repo
 - discover likely script and log candidates
-- prompt for the correct script, log file, metric, optimization goal, and research command
+- auto-assign the script, log file, metric, and optimization goal when possible
 - start the backend on `http://127.0.0.1:8000`
-- start the web UI on `http://localhost:3000`
+- start the web UI on `http://127.0.0.1:3000`
 - open the dashboard in your browser
 
 ## What The UI Shows
@@ -135,10 +174,10 @@ Start without opening the browser:
 autoresearchui --no-open-browser
 ```
 
-Skip prompts and use detected defaults when possible:
+Force prompt-driven mapping:
 
 ```powershell
-autoresearchui --non-interactive
+autoresearchui --interactive-mapping
 ```
 
 Start only the backend:
@@ -162,26 +201,73 @@ autoresearchui --bootstrap-project
 ### CLI flags
 
 - `--project-root`: use an explicit repo instead of the current working tree
-- `--non-interactive`: skip prompts and rely on detected defaults when possible
+- `--interactive-mapping`: prompt for script, log file, metric, goal, and command
+- `--non-interactive`: keep the auto-detected mapping without prompting; this is the default behavior
 - `--no-open-browser`: do not open the dashboard automatically
 - `--backend-only`: start only the backend service
 - `--frontend-only`: start only the frontend service
 - `--skip-install`: fail instead of auto-installing AutoResearchUI app dependencies
 - `--bootstrap-project`: explicitly install dependencies in the detected target repo
 
-## Interactive Mapping
+## Mapping Behavior
 
 AutoResearchUI is built for arbitrary research repos, so it does not assume that every project uses the same filenames.
 
-When the CLI starts, it asks the user to confirm:
+By default, the CLI tries to auto-map:
 
 - `Script to watch`
 - `Log file`
 - `Y-axis metric`
 - `Optimization goal`
-- `Research command`
 
-This keeps the system flexible while avoiding incorrect silent guesses.
+If the mapping is clear enough, AutoResearchUI starts immediately and opens the UI.
+
+If the repo cannot be mapped confidently, AutoResearchUI still starts and leaves the mapping editable in the web app.
+
+If you want to review or override every field from the terminal first, use:
+
+```powershell
+autoresearchui --interactive-mapping
+```
+
+### Karpathy-Style `autoresearch` Repos
+
+If the target repo follows the standard `autoresearch` shape, AutoResearchUI is intended to read it like this:
+
+```text
+prepare.py      fixed constants, data prep, evaluation helpers
+train.py        model, optimizer, training loop, main file the agent edits
+program.md      instructions for the agent and references to output files
+results.tsv     structured experiment history
+run.log         raw stdout/stderr from each run
+analysis.ipynb  post-run notebook for offline analysis
+pyproject.toml  dependency manifest
+```
+
+In that setup:
+
+- `train.py` should usually be `Script to watch`
+- `results.tsv` should usually be the primary `Log file`
+- `run.log` is the fallback log when metrics are printed to stdout before they are written into the TSV
+- `val_bpb`, `loss`, `accuracy`, or similar fields become the `Y-axis metric`
+- `analysis.ipynb` is not a live metric source; it is for after-the-fact analysis
+- `pyproject.toml` is not a watched research file; it only defines dependencies
+
+For the canonical `autoresearch` loop, the repo should actually produce:
+
+1. `run.log` from commands like `uv run train.py > run.log 2>&1`
+2. `results.tsv` with one row appended per finished experiment
+
+Without one of those files being produced, AutoResearchUI can infer the mapping, but it cannot show a real live metric curve yet.
+
+AutoResearchUI can also use repo context to explain its choices in the web UI. For example:
+
+- `train.py`: usually suggested as `Script to watch` because it often contains the model, optimizer, and training loop
+- `prepare.py`: usually treated as supporting code for data prep, constants, or runtime utilities
+- `program.md`: scanned for references to expected log files such as `results.tsv` or `run.log`
+- `pyproject.toml`: used as a repo signal and dependency manifest, but not as a watched research file
+
+If auto-mapping is not perfect, the sidebar now shows a short hint under each selector explaining why a file was suggested.
 
 ## Expected Repo Shape
 
@@ -189,7 +275,25 @@ AutoResearchUI works best when the target repo has:
 
 - a `.git` directory
 - at least one script the agent edits, commonly `.py` or `.v`
-- at least one structured metrics log in `.csv`, `.tsv`, or `.json`
+- at least one structured metrics log in `.csv`, `.tsv`, `.json`, `.jsonl`, or `.ndjson`
+
+One especially clean pattern is:
+
+```text
+prepare.py      constants, data prep, runtime helpers
+train.py        model, optimizer, training loop
+program.md      agent instructions, expected outputs, research protocol
+pyproject.toml  dependencies
+results.tsv     per-experiment metrics written over time
+run.log         plain-text runtime output
+```
+
+In a repo shaped like this, AutoResearchUI will usually:
+
+- suggest `train.py` as the watched script
+- suggest `results.tsv` or `run.log` as the log file
+- infer metrics such as `val_bpb`, `loss`, `accuracy`, or `reward` from the log headers, stdout-style text, and repo docs
+- let the user override the metric manually if needed
 
 Recommended log fields:
 
@@ -273,7 +377,7 @@ This is a developer tool, not a hosted multi-tenant platform.
 [autoresearchui_cli.py](c:\Documents\GitHub\AutoResearchUI\autoresearchui_cli.py)
 
 - repo detection
-- interactive mapping prompts
+- auto-detected mapping with optional interactive prompts
 - local service orchestration
 - optional target-repo bootstrap
 - browser launch
@@ -295,7 +399,7 @@ npm run dev
 Open the dashboard:
 
 ```text
-http://localhost:3000
+http://127.0.0.1:3000
 ```
 
 Type-check the frontend:

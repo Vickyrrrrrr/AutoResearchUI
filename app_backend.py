@@ -4,6 +4,7 @@ import asyncio
 import csv
 import json
 import os
+import re
 import socket
 import shlex
 import subprocess
@@ -17,7 +18,7 @@ from typing import Any, Callable, Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from git import InvalidGitRepositoryError, NoSuchPathError, Repo
+from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
 from pydantic import BaseModel, Field
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -125,6 +126,9 @@ class DiscoveryResult(BaseModel):
     log_candidates: list[str] = Field(default_factory=list)
     script_candidates: list[str] = Field(default_factory=list)
     headers_by_file: dict[str, list[str]] = Field(default_factory=dict)
+    suggested_metrics: list[str] = Field(default_factory=list)
+    suggested_command: str | None = None
+    file_hints: dict[str, str] = Field(default_factory=dict)
     recent_commits: list[GitCommit] = Field(default_factory=list)
 
 
@@ -210,10 +214,58 @@ class HealthReport(BaseModel):
 
 
 class ProjectScanner:
-    LOG_SUFFIXES = {".csv", ".tsv", ".json"}
+    LOG_SUFFIXES = {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".log", ".ipynb"}
     SCRIPT_SUFFIXES = {".py", ".v"}
-    SKIP_DIRS = {".git", ".next", "node_modules", "dist", "build", "__pycache__", ".venv", "venv", ".vendor", ".mypy_cache"}
-    IGNORE_LOG_NAMES = {"package.json", "package-lock.json", "tsconfig.json", "tsconfig.tsbuildinfo"}
+    DOC_SUFFIXES = {".md", ".markdown", ".txt", ".rst"}
+    SKIP_DIRS = {".git", ".next", "node_modules", "dist", "build", "__pycache__", ".venv", "venv", ".vendor", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+    IGNORE_LOG_NAMES = {
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "tsconfig.tsbuildinfo",
+        ".package-lock.json",
+        "pyproject.toml",
+        "uv.lock",
+    }
+    LOG_NAME_PRIORITY = (
+        "results.tsv",
+        "results.csv",
+        "metrics.tsv",
+        "metrics.csv",
+        "metrics.jsonl",
+        "metrics.ndjson",
+        "metrics.json",
+        "run.log",
+        "train.log",
+        "progress.log",
+    )
+    SCRIPT_NAME_PRIORITY = ("train.py", "run.py", "main.py", "research.py", "search.py", "agent.py")
+    FILE_REFERENCE_PATTERN = re.compile(r"(?P<path>[\w./\\-]+\.(?:csv|tsv|json|jsonl|ndjson|log))", re.IGNORECASE)
+    METRIC_PATTERN = re.compile(
+        r"(?P<key>[A-Za-z][A-Za-z0-9_./-]{1,63})\s*[:=]\s*(?P<value>[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    )
+
+    @classmethod
+    def should_skip_dir(cls, name: str) -> bool:
+        if name in cls.SKIP_DIRS:
+            return True
+        if name.startswith("."):
+            return True
+        if name.startswith("venv") or name.startswith(".venv"):
+            return True
+        if name.endswith(".egg-info"):
+            return True
+        return False
+
+    @classmethod
+    def looks_like_metric_name(cls, value: str) -> bool:
+        lowered = value.lower()
+        if lowered in AutoMapper.NON_METRIC_KEYS:
+            return False
+        if lowered.startswith(("val_", "valid_", "eval_", "test_", "train_", "best_")):
+            return True
+        metric_tokens = AutoMapper.MINIMIZE_HINTS + AutoMapper.MAXIMIZE_HINTS + ("perplexity", "ppl", "bleu", "rouge", "auc", "mae", "mse", "rmse")
+        return any(token in lowered for token in metric_tokens)
 
     @classmethod
     def discover(cls, root: Path) -> DiscoveryResult:
@@ -222,9 +274,10 @@ class ProjectScanner:
 
         logs: list[Path] = []
         scripts: list[Path] = []
+        docs: list[Path] = []
         headers_by_file: dict[str, list[str]] = {}
         for current_root, dir_names, file_names in os.walk(root):
-            dir_names[:] = [name for name in dir_names if name not in cls.SKIP_DIRS]
+            dir_names[:] = [name for name in dir_names if not cls.should_skip_dir(name)]
             base = Path(current_root)
             for file_name in file_names:
                 candidate = base / file_name
@@ -235,26 +288,53 @@ class ProjectScanner:
                     logs.append(candidate)
                 if suffix in cls.SCRIPT_SUFFIXES:
                     scripts.append(candidate)
+                if suffix in cls.DOC_SUFFIXES:
+                    docs.append(candidate)
 
-        logs.sort(key=safe_mtime, reverse=True)
-        scripts.sort(key=safe_mtime, reverse=True)
+        referenced_logs, suggested_metrics, suggested_command, reference_sources = cls.inspect_repo_hints(root, docs, scripts, logs)
+        known_logs = {item.resolve(strict=False) for item in logs}
+        for candidate in referenced_logs:
+            resolved = candidate.resolve(strict=False)
+            if resolved not in known_logs and is_subpath(resolved, root):
+                logs.append(candidate)
+                known_logs.add(resolved)
 
+        logs.sort(key=cls.log_rank)
+        scripts.sort(key=cls.script_rank)
+
+        top_logs = logs[:20]
+        top_scripts = scripts[:20]
         for item in logs[:20]:
             headers_by_file[str(item)] = cls.infer_headers(item)
+
+        metric_names = set(suggested_metrics)
+        for headers in headers_by_file.values():
+            metric_names.update(headers)
+
+        file_hints: dict[str, str] = {}
+        for item in top_logs + top_scripts:
+            sources = reference_sources.get(item.resolve(strict=False), set())
+            file_hints[str(item)] = cls.describe_candidate(item, sources)
 
         git_root, commits = cls.git_summary(root)
         return DiscoveryResult(
             project_root=str(root),
             git_root=str(git_root) if git_root else None,
             git_present=git_root is not None,
-            log_candidates=[str(item) for item in logs[:20]],
-            script_candidates=[str(item) for item in scripts[:20]],
+            log_candidates=[str(item) for item in top_logs],
+            script_candidates=[str(item) for item in top_scripts],
             headers_by_file=headers_by_file,
+            suggested_metrics=AutoMapper.rank_metrics(list(metric_names)),
+            suggested_command=suggested_command,
+            file_hints=file_hints,
             recent_commits=commits,
         )
 
     @classmethod
     def infer_headers(cls, path: Path) -> list[str]:
+        if not path.exists() or not path.is_file():
+            return []
+
         suffix = path.suffix.lower()
         if suffix in {".csv", ".tsv"}:
             delimiter = "\t" if suffix == ".tsv" else ","
@@ -269,7 +349,7 @@ class ProjectScanner:
                 return []
             return []
 
-        if suffix == ".json":
+        if suffix in {".json", ".jsonl", ".ndjson"}:
             try:
                 with path.open("r", encoding="utf-8", errors="ignore") as handle:
                     sample = handle.read(131072).strip()
@@ -292,7 +372,166 @@ class ProjectScanner:
                         return list(row.keys())
             return []
 
+        if suffix == ".log":
+            try:
+                with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                    sample = handle.read(131072)
+            except OSError:
+                return []
+            return cls.infer_metric_candidates_from_text(sample)
+
         return []
+
+    @classmethod
+    def infer_metric_candidates_from_text(cls, text: str) -> list[str]:
+        candidates: dict[str, str] = {}
+        for match in cls.METRIC_PATTERN.finditer(text):
+            key = match.group("key").strip("[](){}<>.,:;\"'")
+            lowered = key.lower()
+            if lowered in candidates:
+                continue
+            if not cls.looks_like_metric_name(key):
+                continue
+            candidates[lowered] = key
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip().strip("|")
+            if "\t" not in line and "," not in line:
+                continue
+            delimiter = "\t" if "\t" in line else ","
+            parts = [part.strip(" `|'\"") for part in line.split(delimiter)]
+            if len(parts) < 2:
+                continue
+            if not all(part and re.fullmatch(r"[A-Za-z][A-Za-z0-9_./-]{0,63}", part) for part in parts):
+                continue
+            for part in parts:
+                lowered = part.lower()
+                if lowered in candidates or not cls.looks_like_metric_name(part):
+                    continue
+                candidates[lowered] = part
+
+        return AutoMapper.rank_metrics(list(candidates.values()))
+
+    @classmethod
+    def inspect_repo_hints(
+        cls,
+        root: Path,
+        docs: list[Path],
+        scripts: list[Path],
+        logs: list[Path],
+    ) -> tuple[list[Path], list[str], str | None, dict[Path, set[str]]]:
+        referenced_logs: list[Path] = []
+        metrics: dict[str, str] = {}
+        reference_sources: dict[Path, set[str]] = {}
+        suggested_command: str | None = None
+
+        def add_metrics(values: list[str]) -> None:
+            for value in values:
+                lowered = value.lower()
+                if lowered in metrics:
+                    continue
+                metrics[lowered] = value
+
+        for path in docs[:24]:
+            try:
+                sample = path.read_text(encoding="utf-8", errors="ignore")[:262144]
+            except OSError:
+                continue
+            for match in cls.FILE_REFERENCE_PATTERN.finditer(sample):
+                raw = match.group("path").strip("\"'`()[]{}")
+                candidate = normalize_path(root / raw) if not Path(raw).is_absolute() else normalize_path(raw)
+                if is_subpath(candidate, root) and candidate.name not in cls.IGNORE_LOG_NAMES:
+                    referenced_logs.append(candidate)
+                    reference_sources.setdefault(candidate.resolve(strict=False), set()).add(path.name)
+            if suggested_command is None:
+                suggested_command = cls.infer_command_from_text(sample)
+            add_metrics(cls.infer_metric_candidates_from_text(sample))
+
+        for path in scripts[:12]:
+            try:
+                sample = path.read_text(encoding="utf-8", errors="ignore")[:262144]
+            except OSError:
+                continue
+            add_metrics(cls.infer_metric_candidates_from_text(sample))
+
+        for path in logs[:12]:
+            headers = cls.infer_headers(path)
+            if headers:
+                add_metrics(headers)
+
+        deduped_logs: list[Path] = []
+        seen_logs: set[Path] = set()
+        for candidate in referenced_logs:
+            resolved = candidate.resolve(strict=False)
+            if resolved in seen_logs:
+                continue
+            seen_logs.add(resolved)
+            deduped_logs.append(candidate)
+
+        return deduped_logs, AutoMapper.rank_metrics(list(metrics.values())), suggested_command, reference_sources
+
+    @classmethod
+    def infer_command_from_text(cls, text: str) -> str | None:
+        command_patterns = (
+            re.compile(r"(?mi)^\s*(uv\s+run\s+[^\r\n`]+?)(?:\s*$)"),
+            re.compile(r"(?mi)^\s*(python(?:3)?\s+[^\r\n`]+?)(?:\s*$)"),
+        )
+        for pattern in command_patterns:
+            for match in pattern.finditer(text):
+                command = match.group(1).strip().strip("`")
+                if "train.py" in command or "run.py" in command or "main.py" in command:
+                    return command
+        return None
+
+    @classmethod
+    def describe_candidate(cls, path: Path, sources: set[str]) -> str:
+        name = path.name.lower()
+        source_text = ""
+        if sources:
+            ordered_sources = ", ".join(sorted(sources))
+            source_text = f" Referenced in {ordered_sources}."
+
+        if path.suffix.lower() in cls.SCRIPT_SUFFIXES:
+            if name == "train.py":
+                return "Likely the main training or research loop. This is usually the file the agent edits and reruns." + source_text
+            if name == "prepare.py":
+                return "Usually constants, data preparation, or runtime utilities. Often supporting code rather than the main watched loop." + source_text
+            if name in {"run.py", "main.py", "research.py", "search.py", "agent.py"}:
+                return "Looks like an entrypoint for the experiment loop or agent runner." + source_text
+            return "Candidate research script inside the repo." + source_text
+
+        if path.suffix.lower() == ".log" or name.endswith(".log"):
+            if path.exists():
+                return "Plain-text runtime log. Useful when the research process prints metrics like val_bpb or loss to stdout." + source_text
+            return "Expected runtime log that will be created when the run starts." + source_text
+
+        if path.suffix.lower() in {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".ipynb"}:
+            if path.exists():
+                return "Structured experiment log. This is the best choice when each run appends metric rows." + source_text
+            return "Expected structured metrics file. AutoResearchUI can watch it as soon as the first experiment writes to it." + source_text
+
+        return "Candidate file detected during repo scan." + source_text
+
+    @classmethod
+    def log_rank(cls, path: Path) -> tuple[int, int, int, float]:
+        name = path.name.lower()
+        try:
+            priority = cls.LOG_NAME_PRIORITY.index(name)
+        except ValueError:
+            priority = len(cls.LOG_NAME_PRIORITY)
+        suffix_rank = {".tsv": 0, ".csv": 1, ".jsonl": 2, ".ndjson": 3, ".json": 4, ".ipynb": 5, ".log": 6}.get(path.suffix.lower(), 7)
+        depth = len(path.parts)
+        return (priority, suffix_rank, depth, -safe_mtime(path))
+
+    @classmethod
+    def script_rank(cls, path: Path) -> tuple[int, int, float]:
+        name = path.name.lower()
+        try:
+            priority = cls.SCRIPT_NAME_PRIORITY.index(name)
+        except ValueError:
+            priority = len(cls.SCRIPT_NAME_PRIORITY)
+        depth = len(path.parts)
+        return (priority, depth, -safe_mtime(path))
 
     @classmethod
     def git_summary(cls, root: Path) -> tuple[Path | None, list[GitCommit]]:
@@ -302,14 +541,15 @@ class ProjectScanner:
             return None, []
 
         commits: list[GitCommit] = []
-        for commit in repo.iter_commits(max_count=5):
-            commits.append(
-                GitCommit(
-                    sha=commit.hexsha[:10],
-                    summary=commit.summary,
-                    authored_at=datetime.fromtimestamp(commit.authored_date, timezone.utc).isoformat(),
+        with suppress(ValueError, GitCommandError, OSError):
+            for commit in repo.iter_commits(max_count=5):
+                commits.append(
+                    GitCommit(
+                        sha=commit.hexsha[:10],
+                        summary=commit.summary,
+                        authored_at=datetime.fromtimestamp(commit.authored_date, timezone.utc).isoformat(),
+                    )
                 )
-            )
         return Path(repo.working_tree_dir).resolve(), commits
 
 
@@ -357,7 +597,7 @@ class AutoMapper:
 
         script = discovery.script_candidates[0]
         log_file = discovery.log_candidates[0]
-        headers = discovery.headers_by_file.get(log_file, [])
+        headers = discovery.headers_by_file.get(log_file, []) or discovery.suggested_metrics
         metric = cls.pick_metric(headers)
         if not metric:
             return None
@@ -369,7 +609,7 @@ class AutoMapper:
             log_file=log_file,
             y_axis_metric=metric,
             optimization_goal=goal,
-            research_command=cls.default_command(Path(script)),
+            research_command=discovery.suggested_command or cls.default_command(Path(script)),
         )
 
     @classmethod
@@ -377,15 +617,48 @@ class AutoMapper:
         if not headers:
             return None
 
-        lowered = {header.lower(): header for header in headers}
+        ranked = cls.rank_metrics(headers)
+        lowered = {header.lower(): header for header in ranked}
+        for prefix in ("val_", "valid_", "eval_", "test_", "best_", "train_"):
+            for name in cls.METRIC_PRIORITY:
+                for header in ranked:
+                    lowered_header = header.lower()
+                    if lowered_header.startswith(prefix) and name in lowered_header:
+                        return header
         for name in cls.METRIC_PRIORITY:
             if name in lowered:
                 return lowered[name]
 
-        for header in headers:
+        for header in ranked:
             if header.lower() not in cls.NON_METRIC_KEYS:
                 return header
-        return headers[0]
+        return ranked[0]
+
+    @classmethod
+    def rank_metrics(cls, headers: list[str]) -> list[str]:
+        seen: dict[str, str] = {}
+        for header in headers:
+            candidate = str(header).strip()
+            if not candidate:
+                continue
+            lowered = candidate.lower()
+            if lowered in seen or lowered in cls.NON_METRIC_KEYS:
+                continue
+            seen[lowered] = candidate
+
+        def rank(item: str) -> tuple[int, int, str]:
+            lowered = item.lower()
+            for index, name in enumerate(cls.METRIC_PRIORITY):
+                if lowered.startswith(("val_", "valid_", "eval_", "test_", "best_", "train_")) and name in lowered:
+                    return (0, index, lowered)
+            for index, name in enumerate(cls.METRIC_PRIORITY):
+                if lowered == name:
+                    return (1, index, lowered)
+            if any(token in lowered for token in cls.MINIMIZE_HINTS + cls.MAXIMIZE_HINTS):
+                return (2, len(cls.METRIC_PRIORITY), lowered)
+            return (3, len(cls.METRIC_PRIORITY), lowered)
+
+        return sorted(seen.values(), key=rank)
 
     @classmethod
     def infer_goal(cls, metric_name: str) -> OptimizationGoal:
@@ -465,8 +738,12 @@ class IncrementalLogParser:
         suffix = self.log_file.suffix.lower()
         if suffix in {".csv", ".tsv"}:
             return self._parse_delimited(chunk, delimiter="\t" if suffix == ".tsv" else ",")
-        if suffix == ".json":
+        if suffix in {".json", ".jsonl", ".ndjson"}:
             return self._parse_json(chunk, start_offset=start_offset)
+        if suffix == ".ipynb":
+            return self._parse_ipynb(chunk)
+        if suffix == ".log":
+            return self._parse_text_log(chunk)
         return []
 
     def _parse_delimited(self, chunk: str, delimiter: str) -> list[dict[str, Any]]:
@@ -501,6 +778,57 @@ class IncrementalLogParser:
                 payload = json.loads(line)
                 if isinstance(payload, dict):
                     rows.append(payload)
+        return rows
+
+    def _parse_text_log(self, chunk: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for raw_line in chunk.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            row: dict[str, Any] = {"message": line}
+            metric_found = False
+            for match in ProjectScanner.METRIC_PATTERN.finditer(line):
+                row[match.group("key")] = match.group("value")
+                metric_found = True
+            if metric_found:
+                rows.append(row)
+        return rows
+
+    def _parse_ipynb(self, chunk: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        try:
+            notebook = json.loads(chunk)
+            if not isinstance(notebook, dict) or "cells" not in notebook:
+                return rows
+                
+            for cell in notebook["cells"]:
+                if cell.get("cell_type") != "code":
+                    continue
+                for output in cell.get("outputs", []):
+                    text_blocks = []
+                    if "text" in output:
+                        text_blocks = output["text"]
+                    elif "text/plain" in output.get("data", {}):
+                        text_blocks = output["data"]["text/plain"]
+                    
+                    if not isinstance(text_blocks, list):
+                        text_blocks = [text_blocks]
+                    
+                    for text_block in text_blocks:
+                        for line in str(text_block).splitlines():
+                            clean_line = line.strip()
+                            if not clean_line:
+                                continue
+                            row: dict[str, Any] = {"message": clean_line}
+                            metric_found = False
+                            for match in ProjectScanner.METRIC_PATTERN.finditer(clean_line):
+                                row[match.group("key")] = match.group("value")
+                                metric_found = True
+                            if metric_found:
+                                rows.append(row)
+        except json.JSONDecodeError:
+            pass
         return rows
 
     def _row_to_experiment(self, row: dict[str, Any]) -> ExperimentRecord:
@@ -749,6 +1077,7 @@ class ResearchCoordinator:
         root = normalize_path(config.project_root)
         script = normalize_path(config.script_to_watch)
         log_file = normalize_path(config.log_file)
+        metric_name = config.y_axis_metric.strip()
         if not root.exists():
             raise HTTPException(status_code=404, detail=f"Project root not found: {root}")
         if not root.is_dir():
@@ -759,10 +1088,12 @@ class ResearchCoordinator:
             raise HTTPException(status_code=400, detail="Log file must be inside the selected project root.")
         if not script.exists() or not script.is_file():
             raise HTTPException(status_code=404, detail=f"Script to watch not found: {script}")
-        if not log_file.exists() or not log_file.is_file():
-            raise HTTPException(status_code=404, detail=f"Log file not found: {log_file}")
+        if log_file.exists() and not log_file.is_file():
+            raise HTTPException(status_code=400, detail=f"Log file path is not a file: {log_file}")
+        if not metric_name:
+            raise HTTPException(status_code=400, detail="Choose a Y-axis metric before applying the mapping.")
 
-        available_headers = ProjectScanner.infer_headers(log_file)
+        available_headers = ProjectScanner.infer_headers(log_file) if log_file.exists() else []
         if available_headers and config.y_axis_metric not in available_headers:
             raise HTTPException(
                 status_code=400,
@@ -773,7 +1104,7 @@ class ResearchCoordinator:
             project_root=str(root),
             script_to_watch=str(script),
             log_file=str(log_file),
-            y_axis_metric=config.y_axis_metric,
+            y_axis_metric=metric_name,
             optimization_goal=config.optimization_goal,
             research_command=config.research_command,
         )
@@ -920,7 +1251,7 @@ class ResearchCoordinator:
             return
         payload = self.snapshot().model_dump(mode="json")
         dead: list[WebSocket] = []
-        for connection in self.connections:
+        for connection in tuple(self.connections):
             try:
                 await connection.send_json(payload)
             except Exception:

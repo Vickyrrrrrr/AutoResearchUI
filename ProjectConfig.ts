@@ -15,6 +15,9 @@ export interface DiscoveryResult {
   log_candidates: string[];
   script_candidates: string[];
   headers_by_file: Record<string, string[]>;
+  suggested_metrics: string[];
+  suggested_command: string | null;
+  file_hints: Record<string, string>;
   recent_commits: GitCommit[];
 }
 
