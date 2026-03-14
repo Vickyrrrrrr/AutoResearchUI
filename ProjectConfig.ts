@@ -8,6 +8,25 @@ export interface GitCommit {
   authored_at: string;
 }
 
+export interface CommitMetricPoint {
+  sha: string;
+  summary: string;
+  authored_at: string;
+  best_metric: number | null;
+  iteration_count: number;
+}
+
+export interface GpuStats {
+  index: number;
+  name: string;
+  utilization_pct: number | null;
+  memory_used_mb: number | null;
+  memory_total_mb: number | null;
+  temperature_c: number | null;
+  watts: number | null;
+  available: boolean;
+}
+
 export interface DiscoveryResult {
   project_root: string;
   git_root: string | null;
@@ -19,6 +38,7 @@ export interface DiscoveryResult {
   suggested_command: string | null;
   file_hints: Record<string, string>;
   recent_commits: GitCommit[];
+  program_plan: string[];
 }
 
 export interface MappingConfig {
@@ -89,4 +109,33 @@ export interface HealthReport {
   process_status: ProcessStatus;
   git_required_for_start: boolean;
   endpoints: Record<string, string>;
+}
+
+// ─── Session & API response types ────────────────────────────────────────────
+
+export interface SessionInfo {
+  id: number;
+  project_root: string;
+  script_path: string;
+  log_path: string;
+  metric_name: string;
+  optimization_goal: OptimizationGoal;
+  started_at: string;
+  ended_at: string | null;
+}
+
+export interface SessionData {
+  metric_points: MetricPoint[];
+  experiments: ExperimentRecord[];
+}
+
+export interface RollbackResult {
+  ok: string;
+  sha: string;
+  message: string;
+}
+
+export interface LlmResult {
+  analysis: string;
+  model: string;
 }
